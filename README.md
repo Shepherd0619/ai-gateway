@@ -162,7 +162,6 @@ ai-gateway/
 
 ## Limitations
 
-- **Non-streaming only.** Streaming responses (SSE) are not yet supported — the proxy forces `"stream": false` in every request.
 - **No authentication on the proxy itself.** Deploy it on a trusted network (VPN / tailnet) or put a reverse proxy with auth in front of it.
 - **OpenRouter-specific.** The proxy assumes an Anthropic-skin compatible upstream. It may work with other providers that speak the same format but hasn't been tested.
 
