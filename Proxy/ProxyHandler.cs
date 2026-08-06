@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using AiGateway.Compliance;
 
@@ -46,11 +47,12 @@ internal sealed class ProxyHandler
         using var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8);
         var body = await reader.ReadToEndAsync(ctx.RequestAborted);
 
-        // 3. Rewrite model + force non-streaming
+        // 3. Rewrite model + handle streaming preference
         string? originalModel = null;
         string? upstreamModel = null;
         var bodyToSend = body;
         var contentType = ctx.Request.ContentType ?? "application/json";
+        bool clientWantsStream = false;
 
         if (!string.IsNullOrEmpty(body) && body.TrimStart().StartsWith('{'))
         {
@@ -59,8 +61,13 @@ internal sealed class ProxyHandler
                 var json = JsonNode.Parse(body);
                 if (json is not null)
                 {
-                    // Force non-streaming — we don't handle SSE yet
-                    json["stream"] = false;
+                    // Detect client streaming preference before we force it
+                    if (json["stream"] is JsonValue streamNode)
+                        clientWantsStream = streamNode.GetValueKind() == JsonValueKind.True;
+
+                    // Force non-streaming only if the client didn't request it
+                    if (!clientWantsStream)
+                        json["stream"] = false;
 
                     if (json["model"] is JsonValue modelNode && modelNode.TryGetValue(out string? model))
                     {
@@ -100,7 +107,8 @@ internal sealed class ProxyHandler
         HttpResponseMessage upstreamResp;
         try
         {
-            upstreamResp = await client.SendAsync(upstreamReq, HttpCompletionOption.ResponseContentRead, ctx.RequestAborted);
+            var completionOption = clientWantsStream ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead;
+            upstreamResp = await client.SendAsync(upstreamReq, completionOption, ctx.RequestAborted);
         }
         catch (TaskCanceledException) when (!ctx.RequestAborted.IsCancellationRequested)
         {
@@ -111,33 +119,119 @@ internal sealed class ProxyHandler
         }
         sw.Stop();
 
-        // 5. Read upstream response
-        var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
-
-        // ── Diagnostic logging ──
-        _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
-            (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBody.Length,
-            respBody.Length > 500 ? respBody[..500] : respBody);
-
-        // 6. Rewrite response model back (e.g. DeepSeek → original Claude name)
-        if (originalModel is not null && upstreamModel is not null && upstreamModel != originalModel)
+        // 5. Handle response — streaming or non-streaming
+        if (clientWantsStream && upstreamResp.IsSuccessStatusCode)
         {
-            try
+            await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw);
+        }
+        else
+        {
+            // 5a. Read upstream response (non-streaming or error)
+            var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
+
+            // ── Diagnostic logging ──
+            _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
+                (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBody.Length,
+                respBody.Length > 500 ? respBody[..500] : respBody);
+
+            // 6. Rewrite response model back (e.g. DeepSeek → original Claude name)
+            if (originalModel is not null && upstreamModel is not null && upstreamModel != originalModel)
             {
-                var respJson = JsonNode.Parse(respBody);
-                if (respJson?["model"] is not null)
+                try
                 {
-                    respJson["model"] = originalModel;
-                    respBody = respJson.ToJsonString();
+                    var respJson = JsonNode.Parse(respBody);
+                    if (respJson?["model"] is not null)
+                    {
+                        respJson["model"] = originalModel;
+                        respBody = respJson.ToJsonString();
+                    }
+                }
+                catch (System.Text.Json.JsonException)
+                {
+                    // Response not valid JSON — forward as-is
                 }
             }
-            catch (System.Text.Json.JsonException)
+
+            // 7. Compliance log (non-blocking via Channel)
+            _complianceWriter.TryWrite(new ComplianceEntry
             {
-                // Response not valid JSON — forward as-is
+                Timestamp = DateTime.UtcNow.ToString("o"),
+                Path = path,
+                Method = ctx.Request.Method,
+                ClientIp = ctx.Connection.RemoteIpAddress?.ToString() ?? "-",
+                OriginalModel = originalModel,
+                UpstreamModel = upstreamModel,
+                StatusCode = (int)upstreamResp.StatusCode,
+                DurationMs = sw.ElapsedMilliseconds,
+                RequestBody = body,
+                ResponseBody = respBody
+            });
+
+            // 8. Return proxied response
+            ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
+
+            foreach (var h in upstreamResp.Headers)
+                ctx.Response.Headers[h.Key] = h.Value.ToArray();
+            foreach (var h in upstreamResp.Content.Headers)
+                ctx.Response.Headers.TryAdd(h.Key, h.Value.ToArray());
+
+            // Remove transfer-encoding and content-length — body length changes after model rewrite
+            ctx.Response.Headers.Remove("transfer-encoding");
+            ctx.Response.Headers.Remove("content-length");
+
+            ctx.Response.ContentType = upstreamResp.Content.Headers.ContentType?.ToString() ?? "application/json";
+
+            _logger.LogDebug("DIAG response content-type={ContentType} bodyLen={BodyLen} body={Body}",
+                ctx.Response.ContentType, respBody.Length,
+                respBody.Length > 500 ? respBody[..500] : respBody);
+
+            await ctx.Response.WriteAsync(respBody, ctx.RequestAborted);
+
+            _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms",
+                ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
+                (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds);
+        }
+    }
+
+    private async Task StreamSseResponse(
+        HttpContext ctx,
+        HttpResponseMessage upstreamResp,
+        string? originalModel,
+        string? upstreamModel,
+        string requestBody,
+        string path,
+        Stopwatch sw)
+    {
+        ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
+        ctx.Response.ContentType = "text/event-stream";
+        ctx.Response.Headers["cache-control"] = "no-cache, no-store";
+        ctx.Response.Headers["connection"] = "keep-alive";
+
+        using var upstreamStream = await upstreamResp.Content.ReadAsStreamAsync(ctx.RequestAborted);
+        using var reader = new StreamReader(upstreamStream, Encoding.UTF8);
+        var doRewrite = originalModel is not null && upstreamModel is not null && upstreamModel != originalModel;
+
+        while (!reader.EndOfStream)
+        {
+            var line = await reader.ReadLineAsync(ctx.RequestAborted);
+
+            if (line is null)
+                break;
+
+            // Rewrite model name in data: lines
+            if (doRewrite && line.StartsWith("data:") && line.Contains(upstreamModel!))
+            {
+                line = line.Replace(upstreamModel!, originalModel!);
             }
+
+            await ctx.Response.WriteAsync(line + "\n", ctx.RequestAborted);
+
+            // Flush after blank lines (SSE event boundaries) for low-latency delivery
+            if (line.Length == 0)
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
         }
 
-        // 7. Compliance log (non-blocking via Channel)
+        // Compliance log (abbreviated — we can't capture the full SSE stream)
         _complianceWriter.TryWrite(new ComplianceEntry
         {
             Timestamp = DateTime.UtcNow.ToString("o"),
@@ -148,31 +242,11 @@ internal sealed class ProxyHandler
             UpstreamModel = upstreamModel,
             StatusCode = (int)upstreamResp.StatusCode,
             DurationMs = sw.ElapsedMilliseconds,
-            RequestBody = body,
-            ResponseBody = respBody
+            RequestBody = requestBody,
+            ResponseBody = "[streaming]"
         });
 
-        // 8. Return proxied response
-        ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
-
-        foreach (var h in upstreamResp.Headers)
-            ctx.Response.Headers[h.Key] = h.Value.ToArray();
-        foreach (var h in upstreamResp.Content.Headers)
-            ctx.Response.Headers.TryAdd(h.Key, h.Value.ToArray());
-
-        // Remove transfer-encoding and content-length — body length changes after model rewrite
-        ctx.Response.Headers.Remove("transfer-encoding");
-        ctx.Response.Headers.Remove("content-length");
-
-        ctx.Response.ContentType = upstreamResp.Content.Headers.ContentType?.ToString() ?? "application/json";
-
-        _logger.LogDebug("DIAG response content-type={ContentType} bodyLen={BodyLen} body={Body}",
-            ctx.Response.ContentType, respBody.Length,
-            respBody.Length > 500 ? respBody[..500] : respBody);
-
-        await ctx.Response.WriteAsync(respBody, ctx.RequestAborted);
-
-        _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms",
+        _logger.LogInformation("Proxy SSE {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms",
             ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
             (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds);
     }
