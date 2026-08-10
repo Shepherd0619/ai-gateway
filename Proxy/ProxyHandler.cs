@@ -181,15 +181,21 @@ internal sealed class ProxyHandler
         }
         sw.Stop();
 
-        // 5. Handle response — streaming or non-streaming
-        if (clientWantsStream && upstreamResp.IsSuccessStatusCode)
+        // 5. Handle response — streaming or non-streaming.
+        //    HttpResponseMessage must be disposed to return the underlying
+        //    HTTP connection to the pool.  Without this, each client
+        //    disconnect leaks a connection and causes socket exhaustion
+        //    → thread pool starvation (Kestrel heartbeat warnings).
+        using (upstreamResp)
         {
-            await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw, role);
-        }
-        else
-        {
-            // 5a. Read upstream response (non-streaming or error)
-            var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
+            if (clientWantsStream && upstreamResp.IsSuccessStatusCode)
+            {
+                await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw, role);
+            }
+            else
+            {
+                // 5a. Read upstream response (non-streaming or error)
+                var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
 
             // ── Diagnostic logging ──
             if (upstreamResp.IsSuccessStatusCode)
@@ -257,6 +263,7 @@ internal sealed class ProxyHandler
                 ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
                 (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds,
                 role is not null ? $" [{role}]" : "");
+            }
         }
     }
 
@@ -272,31 +279,41 @@ internal sealed class ProxyHandler
     {
         ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
         ctx.Response.ContentType = "text/event-stream";
-        ctx.Response.Headers["cache-control"] = "no-cache, no-store";
-        ctx.Response.Headers["connection"] = "keep-alive";
+        ctx.Response.Headers["Cache-Control"] = "no-cache, no-store";
+        ctx.Response.Headers["Connection"] = "keep-alive";
 
         using var upstreamStream = await upstreamResp.Content.ReadAsStreamAsync(ctx.RequestAborted);
         using var reader = new StreamReader(upstreamStream, Encoding.UTF8);
         var doRewrite = originalModel is not null && upstreamModel is not null && upstreamModel != originalModel;
 
-        while (!reader.EndOfStream)
+        try
         {
-            var line = await reader.ReadLineAsync(ctx.RequestAborted);
-
-            if (line is null)
-                break;
-
-            // Rewrite model name in data: lines
-            if (doRewrite && line.StartsWith("data:") && line.Contains(upstreamModel!))
+            while (!reader.EndOfStream)
             {
-                line = line.Replace(upstreamModel!, originalModel!);
+                var line = await reader.ReadLineAsync(ctx.RequestAborted);
+
+                if (line is null)
+                    break;
+
+                // Rewrite model name in data: lines
+                if (doRewrite && line.StartsWith("data:") && line.Contains(upstreamModel!))
+                {
+                    line = line.Replace(upstreamModel!, originalModel!);
+                }
+
+                await ctx.Response.WriteAsync(line + "\n", ctx.RequestAborted);
+
+                // Flush after blank lines (SSE event boundaries) for low-latency delivery
+                if (line.Length == 0)
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
-
-            await ctx.Response.WriteAsync(line + "\n", ctx.RequestAborted);
-
-            // Flush after blank lines (SSE event boundaries) for low-latency delivery
-            if (line.Length == 0)
-                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+        }
+        catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+        {
+            _logger.LogInformation("Proxy SSE client disconnected {Method} {Path} {Original}->{Upstream} {DurationMs}ms{Role}",
+                ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
+                sw.ElapsedMilliseconds, role is not null ? $" [{role}]" : "");
+            return;
         }
 
         // Compliance log (abbreviated — we can't capture the full SSE stream)
