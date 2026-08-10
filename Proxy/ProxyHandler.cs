@@ -13,6 +13,7 @@ internal sealed class ProxyHandler
     private readonly ModelMapper _mapper;
     private readonly ComplianceLogWriter _complianceWriter;
     private readonly string _upstreamBaseUrl;
+    private readonly string? _classifierTargetModel;
 
     public ProxyHandler(
         IHttpClientFactory hcf,
@@ -27,19 +28,28 @@ internal sealed class ProxyHandler
         _complianceWriter = complianceWriter;
         _upstreamBaseUrl = configuration.GetValue<string>("Upstream:BaseUrl")
             ?? "https://openrouter.ai/api";
+        _classifierTargetModel = configuration.GetValue<string?>("Classifier:TargetModel");
+        if (_classifierTargetModel is not null)
+            _logger.LogInformation("Classifier detection enabled, target model: {TargetModel}", _classifierTargetModel);
     }
 
     internal async Task Invoke(HttpContext ctx)
     {
         var path = ctx.Request.Path.Value ?? "/";
 
-        // 1. Extract API key
+        // 1. Extract API key — supports both x-api-key (desktop) and Authorization: Bearer (CLI)
         var clientKey = ctx.Request.Headers["x-api-key"].FirstOrDefault();
+        if (string.IsNullOrEmpty(clientKey))
+        {
+            var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault();
+            if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                clientKey = authHeader["Bearer ".Length..].Trim();
+        }
         if (string.IsNullOrEmpty(clientKey))
         {
             ctx.Response.StatusCode = 401;
             ctx.Response.ContentType = "application/json";
-            await ctx.Response.WriteAsync("""{"error":{"type":"authentication_error","message":"Missing x-api-key"}}""", ctx.RequestAborted);
+            await ctx.Response.WriteAsync("""{"error":{"type":"authentication_error","message":"Missing x-api-key or Authorization: Bearer header"}}""", ctx.RequestAborted);
             return;
         }
 
@@ -50,6 +60,7 @@ internal sealed class ProxyHandler
         // 3. Rewrite model + handle streaming preference
         string? originalModel = null;
         string? upstreamModel = null;
+        string? role = null;
         var bodyToSend = body;
         var contentType = ctx.Request.ContentType ?? "application/json";
         bool clientWantsStream = false;
@@ -69,7 +80,58 @@ internal sealed class ProxyHandler
                     if (!clientWantsStream)
                         json["stream"] = false;
 
-                    if (json["model"] is JsonValue modelNode && modelNode.TryGetValue(out string? model))
+                    // ── Classifier detection ──
+                    // Auto-mode security classifier requests are short safety checks.
+                    // Route them to a faster model (e.g. deepseek-v4-flash) so they
+                    // stay responsive even when the main model is slow or unavailable.
+                    var isClassifier = _classifierTargetModel is not null && ClassifierDetector.IsClassifierRequest(body);
+                    if (_classifierTargetModel is not null)
+                    {
+                        // Diagnostic: log system prompt structure to help debug classifier detection
+                        var sysNode = json["system"];
+                        if (sysNode is JsonArray arr)
+                        {
+                            var previews = new List<string>();
+                            foreach (var block in arr)
+                            {
+                                var text = block?["text"]?.GetValue<string>();
+                                if (text is not null)
+                                    previews.Add(text.Length > 80 ? text[..80] + "…" : text);
+                            }
+                            _logger.LogDebug("DIAG classifier system array[{Count}]: texts={Previews} isClassifier={IsClassifier}",
+                                arr.Count, string.Join(" | ", previews), isClassifier);
+                        }
+                        else if (sysNode is not null)
+                        {
+                            _logger.LogDebug("DIAG classifier system is {Type}, not JsonArray — skipping detection", sysNode.GetType().Name);
+                        }
+                    }
+                    if (isClassifier)
+                    {
+                        role = "classifier";
+                        originalModel = json["model"]?.GetValue<string>() ?? "claude-sonnet-4-20250514";
+                        upstreamModel = _classifierTargetModel;
+                        json["model"] = upstreamModel;
+
+                        // Strip x-anthropic-billing-header block — Anthropic-internal metadata not needed by upstream
+                        if (json["system"] is JsonArray systemArr)
+                        {
+                            var toRemove = new List<JsonNode?>();
+                            foreach (var block in systemArr)
+                            {
+                                var text = block?["text"]?.GetValue<string>();
+                                if (text is not null && text.StartsWith("x-anthropic-billing-header:", StringComparison.Ordinal))
+                                    toRemove.Add(block);
+                            }
+                            foreach (var block in toRemove)
+                                systemArr.Remove(block);
+                            if (toRemove.Count > 0)
+                                _logger.LogDebug("Stripped {Count} billing-header block(s) from classifier request", toRemove.Count);
+                        }
+
+                        _logger.LogDebug("Classifier request detected, routing to {TargetModel}", upstreamModel);
+                    }
+                    else if (json["model"] is JsonValue modelNode && modelNode.TryGetValue(out string? model))
                     {
                         originalModel = model;
                         upstreamModel = _mapper.Map(originalModel);
@@ -122,7 +184,7 @@ internal sealed class ProxyHandler
         // 5. Handle response — streaming or non-streaming
         if (clientWantsStream && upstreamResp.IsSuccessStatusCode)
         {
-            await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw);
+            await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw, role);
         }
         else
         {
@@ -130,9 +192,13 @@ internal sealed class ProxyHandler
             var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
 
             // ── Diagnostic logging ──
-            _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
-                (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBody.Length,
-                respBody.Length > 500 ? respBody[..500] : respBody);
+            if (upstreamResp.IsSuccessStatusCode)
+                _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
+                    (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBody.Length,
+                    respBody.Length > 500 ? respBody[..500] : respBody);
+            else
+                _logger.LogInformation("DIAG upstream ERROR status={Status} body={Body}",
+                    (int)upstreamResp.StatusCode, respBody);
 
             // 6. Rewrite response model back (e.g. DeepSeek → original Claude name)
             if (originalModel is not null && upstreamModel is not null && upstreamModel != originalModel)
@@ -187,9 +253,10 @@ internal sealed class ProxyHandler
 
             await ctx.Response.WriteAsync(respBody, ctx.RequestAborted);
 
-            _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms",
+            _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms{Role}",
                 ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
-                (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds);
+                (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds,
+                role is not null ? $" [{role}]" : "");
         }
     }
 
@@ -200,7 +267,8 @@ internal sealed class ProxyHandler
         string? upstreamModel,
         string requestBody,
         string path,
-        Stopwatch sw)
+        Stopwatch sw,
+        string? role)
     {
         ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
         ctx.Response.ContentType = "text/event-stream";
@@ -246,8 +314,9 @@ internal sealed class ProxyHandler
             ResponseBody = "[streaming]"
         });
 
-        _logger.LogInformation("Proxy SSE {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms",
+        _logger.LogInformation("Proxy SSE {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms{Role}",
             ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
-            (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds);
+            (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds,
+            role is not null ? $" [{role}]" : "");
     }
 }
