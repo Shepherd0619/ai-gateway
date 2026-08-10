@@ -198,7 +198,7 @@ internal sealed class ProxyHandler
                     respBody.Length > 500 ? respBody[..500] : respBody);
             else
                 _logger.LogInformation("DIAG upstream ERROR status={Status} body={Body}",
-                    (int)upstreamResp.StatusCode, respBody);
+                    (int)upstreamResp.StatusCode, respBody.Length > 1000 ? respBody[..1000] : respBody);
 
             // 6. Rewrite response model back (e.g. DeepSeek → original Claude name)
             if (originalModel is not null && upstreamModel is not null && upstreamModel != originalModel)
