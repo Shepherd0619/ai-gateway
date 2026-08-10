@@ -3,9 +3,11 @@
 [![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-BSD%203--Clause-blue.svg)](LICENSE)
 
-A lightweight reverse proxy that lets you use non-Anthropic models with tools that are hard-coded to the Anthropic Messages API. It presents a Claude-compatible model list, rewrites model names in-flight, and forwards everything else to OpenRouter's Anthropic-compatible API.
+A lightweight reverse proxy that lets you use non-Anthropic models with tools hard-coded to the Anthropic Messages API. It presents a Claude-compatible model list, rewrites model names in-flight, and forwards requests to OpenRouter's Anthropic-compatible API.
 
-**Why?** Some AI tools (e.g. Claude Code Co-work) filter available models to Anthropic's own list and won't let you pick anything else — even when the upstream provider speaks the same API format. This proxy sidesteps that limitation without touching the tool itself.
+**Why?** Some AI tools (e.g. Claude Code) filter available models to Anthropic's own list and won't let you pick anything else — even when the upstream provider speaks the same API format. This proxy sidesteps that limitation without touching the tool itself.
+
+**Auto-mode classifier routing.** When using Claude Code with a model like DeepSeek V4 Pro, the auto-mode security classifier inherits the main model. If that model slows down or becomes unavailable, the classifier fails and auto-mode breaks. The proxy detects these classifier requests by their system-prompt signature and routes them to a faster, separate model (e.g. DeepSeek V4 Flash), keeping auto-mode responsive.
 
 ## How it works
 
@@ -25,8 +27,9 @@ flowchart LR
 ```
 
 1. **Model discovery** — `GET /v1/models` returns a Claude-flavored model list so the client tool sees models it trusts.
-2. **Model rewriting** — `claude-sonnet-4-20250514` in the request body becomes `deepseek/deepseek-v4-pro` before it hits OpenRouter. The response model name is rewritten back so the client never notices.
-3. **API key passthrough (BYOK)** — The client's `x-api-key` header becomes the `Authorization: Bearer` token sent upstream. You use your own OpenRouter key — no shared keys, no proxy-side auth.
+2. **Classifier detection** — Auto-mode security classifier requests are identified by their system-prompt signature and routed to a dedicated fast model (`Classifier:TargetModel`), bypassing the main model entirely.
+3. **Model rewriting** — `claude-sonnet-4-20250514` in the request body becomes `deepseek/deepseek-v4-pro` before it hits OpenRouter. The response model name is rewritten back so the client never notices.
+4. **API key passthrough (BYOK)** — Both `x-api-key` (desktop) and `Authorization: Bearer` (CLI) headers are accepted. The key is forwarded as `Authorization: Bearer` upstream. You use your own OpenRouter key — no shared keys, no proxy-side auth.
 
 Because OpenRouter's `/api` base already speaks the Anthropic Messages format natively, no protocol translation is needed. Only the model name changes.
 
@@ -98,6 +101,7 @@ All settings live in `appsettings.json`.
 |---|---|---|---|
 | `ModelMapping` | `Rules` | — | Array of `{ "Prefix", "Target" }` objects for model name rewriting |
 | `Upstream` | `BaseUrl` | `https://openrouter.ai/api` | Upstream API base URL |
+| `Classifier` | `TargetModel` | — | Fast model for auto-mode classifier requests (remove to disable) |
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
 | `ComplianceLog` | `Path` | `/var/log/ai-gateway/compliance.log` | Where to write the compliance log |
 | `Kestrel` | `Endpoints.Http.Url` | `http://0.0.0.0:4000` | Listen address and port |
@@ -132,8 +136,9 @@ Tests connectivity to the configured upstream with a 5-second timeout. Returns `
 ai-gateway/
 ├── Program.cs                      # App entry point, DI, middleware pipeline
 ├── Proxy/
-│   ├── ProxyHandler.cs             # Core proxy logic: key extraction, model rewrite, forwarding
-│   └── ModelMapper.cs              # Prefix-based model name mapping
+│   ├── ProxyHandler.cs             # Core proxy logic: auth, classifier detection, model rewrite, forwarding
+│   ├── ModelMapper.cs              # Prefix-based model name mapping
+│   └── ClassifierDetector.cs       # Detects auto-mode classifier requests by system-prompt signature
 ├── Configuration/
 │   ├── MappingRule.cs              # Record: Prefix → Target
 │   ├── ModelMappingOptions.cs      # Record: list of MappingRules
@@ -164,6 +169,7 @@ ai-gateway/
 
 - **No authentication on the proxy itself.** Deploy it on a trusted network (VPN / tailnet) or put a reverse proxy with auth in front of it.
 - **OpenRouter-specific.** The proxy assumes an Anthropic-skin compatible upstream. It may work with other providers that speak the same format but hasn't been tested.
+- **Prompt injection protection.** OpenRouter's prompt injection guard may block classifier requests as false positives. If auto-mode fails with a `403` and `"prompt injection patterns detected"`, disable this protection in your [OpenRouter account settings](https://openrouter.ai/settings) under "Prompt Security".
 
 ## License
 

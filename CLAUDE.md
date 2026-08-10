@@ -44,12 +44,15 @@ This is a lightweight reverse proxy that spoofs Anthropic model discovery and re
 
 1. **Model discovery** — `GET /v1/models` (`Discovery/ModelDiscoveryEndpoints.cs`) returns a hardcoded Claude-flavored model list so the client tool trusts the available models.
 2. **Proxy** — `POST /v1/{**catchAll}` (`Proxy/ProxyHandler.cs`) does the core work:
-   - Extracts `x-api-key` → returns 401 if missing
-   - Parses JSON body, detects client's `"stream": true/false` preference, rewrites `model` field via `ModelMapper`
+   - Extracts API key from `x-api-key` (desktop) or `Authorization: Bearer` (CLI) → returns 401 if missing
+   - Parses JSON body, detects client's `"stream": true/false` preference
+   - **Classifier detection** examines the `system` array for auto-mode classifier signatures and routes matching requests to `Classifier:TargetModel` instead of the main model
+   - **Model rewriting** maps `model` field via `ModelMapper` (prefix-based, first-match-wins)
    - **Non-streaming** (default or `stream: false`): forces `stream: false`, reads full upstream response, rewrites model name back in JSON body, sends as single response
    - **Streaming** (`stream: true`): passes `stream: true` through to upstream, streams SSE response line-by-line, rewrites model name in `data:` lines, flushes after each blank-line SSE event boundary
    - Forwards to the configured upstream (`Upstream:BaseUrl`) with `Authorization: Bearer` and `anthropic-version` headers
    - Writes a compliance log entry (if enabled) via a non-blocking `Channel<T>.TryWrite`
+   - Log messages include a `[classifier]` role tag for classifier-routed requests
 
 ### SSE streaming (`Proxy/ProxyHandler.cs` → `StreamSseResponse`)
 
@@ -59,6 +62,15 @@ This is a lightweight reverse proxy that spoofs Anthropic model discovery and re
 - Model name rewriting in SSE uses simple string replacement on `data:` lines only (`upstreamModel → originalModel`), guarded by `doRewrite` null-check
 - Sets `Content-Type: text/event-stream`, `Cache-Control: no-cache, no-store`, `Connection: keep-alive`
 - Compliance log for streaming stores `ResponseBody = "[streaming]"` (can't capture full SSE stream)
+
+### Classifier detection (`Proxy/ProxyHandler.cs` + `Proxy/ClassifierDetector.cs`)
+
+Claude Code auto-mode sends lightweight security-classifier requests before executing tool calls. These requests share the main model by default, so when the main model is slow or unavailable, auto-mode breaks. The proxy detects classifier requests by matching two system-prompt signatures:
+
+- A system block starting with `x-anthropic-billing-header:`
+- A system block starting with `You are a security monitor`
+
+Both must be present in the `system` array. When detected, the request is routed to `Classifier:TargetModel` (e.g. `deepseek-v4-flash`) instead of the main model. The Anthropic-internal `x-anthropic-billing-header` block is stripped before forwarding. Remove the `Classifier:TargetModel` config key to disable.
 
 ### Model mapping (`Proxy/ModelMapper.cs`)
 
@@ -71,7 +83,7 @@ A browser CORS policy is configured via `appsettings.json` → `Cors:AllowedOrig
 ### Key constraints
 
 - **Both streaming (SSE) and non-streaming are supported.** Streaming is opt-in via `"stream": true` in the request body.
-- **No auth on the proxy itself.** BYOK via `x-api-key` → `Authorization: Bearer`. Deploy on a trusted network.
+- **No auth on the proxy itself.** BYOK via `x-api-key` (desktop) or `Authorization: Bearer` (CLI) → forwarded as `Authorization: Bearer`. Deploy on a trusted network.
 - **`InvariantGlobalization = true`** in the csproj — no culture-specific behavior.
 - **Container base:** `mcr.microsoft.com/dotnet/aspnet:9.0-noble-chiseled` — distroless, no shell. ASP.NET runtime required for Kestrel.
 
