@@ -61,6 +61,7 @@ internal sealed class ProxyHandler
         string? originalModel = null;
         string? upstreamModel = null;
         string? role = null;
+        string? proxyServer = null;
         var bodyToSend = body;
         var contentType = ctx.Request.ContentType ?? "application/json";
         bool clientWantsStream = false;
@@ -134,7 +135,9 @@ internal sealed class ProxyHandler
                     else if (json["model"] is JsonValue modelNode && modelNode.TryGetValue(out string? model))
                     {
                         originalModel = model;
-                        upstreamModel = _mapper.Map(originalModel);
+                        var mapResult = _mapper.Map(originalModel);
+                        upstreamModel = mapResult.TargetModel;
+                        proxyServer = mapResult.ProxyServer;
                         if (upstreamModel != originalModel)
                         {
                             json["model"] = upstreamModel;
@@ -151,7 +154,10 @@ internal sealed class ProxyHandler
 
         // 4. Build and send upstream request
         var fullUrl = _upstreamBaseUrl + path;
-        var client = _hcf.CreateClient("openrouter");
+        var httpClientName = !string.IsNullOrEmpty(proxyServer)
+            ? $"openrouter-proxy-{proxyServer}"
+            : "openrouter";
+        var client = _hcf.CreateClient(httpClientName);
         using var upstreamReq = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), fullUrl)
         {
             Content = new StringContent(bodyToSend, Encoding.UTF8, contentType)
