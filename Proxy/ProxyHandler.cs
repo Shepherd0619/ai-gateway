@@ -54,7 +54,7 @@ internal sealed class ProxyHandler
         }
 
         // 2. Read request body
-        using var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8);
+        using var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8, leaveOpen: true);
         var body = await reader.ReadToEndAsync(ctx.RequestAborted);
 
         // 3. Rewrite model + handle streaming preference
@@ -194,77 +194,99 @@ internal sealed class ProxyHandler
             }
             else
             {
-                // 5a. Read upstream response (non-streaming or error)
-                var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
-
-            // ── Diagnostic logging ──
-            if (upstreamResp.IsSuccessStatusCode)
-                _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
-                    (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBody.Length,
-                    respBody.Length > 500 ? respBody[..500] : respBody);
-            else
-                _logger.LogInformation("DIAG upstream ERROR status={Status} body={Body}",
-                    (int)upstreamResp.StatusCode, respBody.Length > 1000 ? respBody[..1000] : respBody);
-
-            // 6. Rewrite response model back (e.g. DeepSeek → original Claude name)
-            if (originalModel is not null && upstreamModel is not null && upstreamModel != originalModel)
-            {
                 try
                 {
-                    var respJson = JsonNode.Parse(respBody);
-                    if (respJson?["model"] is not null)
-                    {
-                        respJson["model"] = originalModel;
-                        respBody = respJson.ToJsonString();
-                    }
+                    await HandleNonStreaming(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw, role);
                 }
-                catch (System.Text.Json.JsonException)
+                catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
                 {
-                    // Response not valid JSON — forward as-is
+                    _logger.LogInformation("Proxy client disconnected {Method} {Path} {Original}->{Upstream} {DurationMs}ms{Role}",
+                        ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
+                        sw.ElapsedMilliseconds, role is not null ? $" [{role}]" : "");
                 }
-            }
-
-            // 7. Compliance log (non-blocking via Channel)
-            _complianceWriter.TryWrite(new ComplianceEntry
-            {
-                Timestamp = DateTime.UtcNow.ToString("o"),
-                Path = path,
-                Method = ctx.Request.Method,
-                ClientIp = ctx.Connection.RemoteIpAddress?.ToString() ?? "-",
-                OriginalModel = originalModel,
-                UpstreamModel = upstreamModel,
-                StatusCode = (int)upstreamResp.StatusCode,
-                DurationMs = sw.ElapsedMilliseconds,
-                RequestBody = body,
-                ResponseBody = respBody
-            });
-
-            // 8. Return proxied response
-            ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
-
-            foreach (var h in upstreamResp.Headers)
-                ctx.Response.Headers[h.Key] = h.Value.ToArray();
-            foreach (var h in upstreamResp.Content.Headers)
-                ctx.Response.Headers.TryAdd(h.Key, h.Value.ToArray());
-
-            // Remove transfer-encoding and content-length — body length changes after model rewrite
-            ctx.Response.Headers.Remove("transfer-encoding");
-            ctx.Response.Headers.Remove("content-length");
-
-            ctx.Response.ContentType = upstreamResp.Content.Headers.ContentType?.ToString() ?? "application/json";
-
-            _logger.LogDebug("DIAG response content-type={ContentType} bodyLen={BodyLen} body={Body}",
-                ctx.Response.ContentType, respBody.Length,
-                respBody.Length > 500 ? respBody[..500] : respBody);
-
-            await ctx.Response.WriteAsync(respBody, ctx.RequestAborted);
-
-            _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms{Role}",
-                ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
-                (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds,
-                role is not null ? $" [{role}]" : "");
             }
         }
+    }
+
+    private async Task HandleNonStreaming(
+        HttpContext ctx,
+        HttpResponseMessage upstreamResp,
+        string? originalModel,
+        string? upstreamModel,
+        string requestBody,
+        string path,
+        Stopwatch sw,
+        string? role)
+    {
+        // Read upstream response (non-streaming or error)
+        var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
+
+        // ── Diagnostic logging ──
+        if (upstreamResp.IsSuccessStatusCode)
+            _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
+                (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBody.Length,
+                respBody.Length > 500 ? respBody[..500] : respBody);
+        else
+            _logger.LogInformation("DIAG upstream ERROR status={Status} body={Body}",
+                (int)upstreamResp.StatusCode, respBody.Length > 1000 ? respBody[..1000] : respBody);
+
+        // Rewrite response model back (e.g. DeepSeek → original Claude name)
+        if (originalModel is not null && upstreamModel is not null && upstreamModel != originalModel)
+        {
+            try
+            {
+                var respJson = JsonNode.Parse(respBody);
+                if (respJson?["model"] is not null)
+                {
+                    respJson["model"] = originalModel;
+                    respBody = respJson.ToJsonString();
+                }
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                // Response not valid JSON — forward as-is
+            }
+        }
+
+        // Compliance log (non-blocking via Channel)
+        _complianceWriter.TryWrite(new ComplianceEntry
+        {
+            Timestamp = DateTime.UtcNow.ToString("o"),
+            Path = path,
+            Method = ctx.Request.Method,
+            ClientIp = ctx.Connection.RemoteIpAddress?.ToString() ?? "-",
+            OriginalModel = originalModel,
+            UpstreamModel = upstreamModel,
+            StatusCode = (int)upstreamResp.StatusCode,
+            DurationMs = sw.ElapsedMilliseconds,
+            RequestBody = requestBody,
+            ResponseBody = respBody
+        });
+
+        // Return proxied response
+        ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
+
+        foreach (var h in upstreamResp.Headers)
+            ctx.Response.Headers[h.Key] = h.Value.ToArray();
+        foreach (var h in upstreamResp.Content.Headers)
+            ctx.Response.Headers.TryAdd(h.Key, h.Value.ToArray());
+
+        // Remove transfer-encoding and content-length — body length changes after model rewrite
+        ctx.Response.Headers.Remove("transfer-encoding");
+        ctx.Response.Headers.Remove("content-length");
+
+        ctx.Response.ContentType = upstreamResp.Content.Headers.ContentType?.ToString() ?? "application/json";
+
+        _logger.LogDebug("DIAG response content-type={ContentType} bodyLen={BodyLen} body={Body}",
+            ctx.Response.ContentType, respBody.Length,
+            respBody.Length > 500 ? respBody[..500] : respBody);
+
+        await ctx.Response.WriteAsync(respBody, ctx.RequestAborted);
+
+        _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms{Role}",
+            ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
+            (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds,
+            role is not null ? $" [{role}]" : "");
     }
 
     private async Task StreamSseResponse(
