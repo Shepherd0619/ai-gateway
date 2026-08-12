@@ -25,7 +25,7 @@ internal static class HealthEndpoints
             try
             {
                 using var request = new HttpRequestMessage(HttpMethod.Head, upstreamBaseUrl);
-                await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
                 sw.Stop();
 
                 logger.LogDebug("Health check OK: {Url} {LatencyMs}ms", upstreamBaseUrl, sw.ElapsedMilliseconds);

@@ -27,6 +27,17 @@ builder.Services.AddHttpClient("openrouter", client =>
 {
     client.BaseAddress = new Uri(upstreamBaseUrl);
     client.Timeout = TimeSpan.FromMinutes(10);
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+{
+    // Recycle connections every 5 minutes to pick up DNS changes and
+    // prevent stale connections from accumulating in the pool.
+    PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+    // Keep idle connections alive for 2 minutes to reduce TCP handshake
+    // overhead for bursty traffic patterns.
+    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+    // Enable multiple HTTP/2 connections to the same endpoint for
+    // concurrent streaming requests.
+    EnableMultipleHttp2Connections = true
 });
 
 // ── Application services ──
