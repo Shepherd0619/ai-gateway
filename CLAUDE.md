@@ -76,6 +76,34 @@ Both must be present in the `system` array. When detected, the request is routed
 
 Prefix-based, first-match-wins. Rules come from `appsettings.json` → `ModelMapping:Rules` and are evaluated in order. The `claude-haiku` rule must appear before the `claude` catch-all. No regex — just `string.StartsWith`.
 
+Each rule can optionally reference a `ProxyServer` to route requests through a SOCKS5 proxy — useful when the upstream enforces geo-restrictions on certain models.
+
+### Per-model proxy routing (`Proxy/Socks5ConnectCallback.cs` + `Configuration/ProxyServerOptions.cs`)
+
+When OpenRouter blocks models in your region, you can route specific model prefixes through a SOCKS5 proxy. Configure named proxy servers and reference them in model rules:
+
+```json
+{
+  "ProxyServers": {
+    "us-exit": { "Address": "socks5://proxy-host:7890" }
+  },
+  "ModelMapping": {
+    "Rules": [
+      { "Prefix": "google/",    "ProxyServer": "us-exit" },
+      { "Prefix": "anthropic/", "ProxyServer": "us-exit" }
+    ]
+  }
+}
+```
+
+- `ProxyServers` — named proxy server definitions. Each has an `Address` in `socks5://host:port` format. No auth support.
+- `ModelMapping.Rules[].ProxyServer` — optional reference to a proxy server name. Omitted/null means direct connection.
+- `Target` and `ProxyServer` are independent — a rule can rewrite the model name, route through a proxy, or both.
+- Use env vars or `appsettings.Development.json` for the real proxy address — don't commit internal IPs to the public repo.
+- The proxy MUST be a SOCKS5 server (no auth). Mihomo/Clash `mixed-port` works.
+- Proxy failures are hard errors — no fallback to direct.
+- SSE streaming works transparently through the proxy.
+
 ### CORS
 
 A browser CORS policy is configured via `appsettings.json` → `Cors:AllowedOrigins` (array of origin strings, e.g. `["https://pivot.claude.ai"]`). Applied as middleware in `Program.cs`. Configured in `Configuration/CorsOptions.cs`.
