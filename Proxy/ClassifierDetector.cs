@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+using System.Text.Json;
 
 namespace AiGateway.Proxy;
 
@@ -12,43 +12,40 @@ internal static class ClassifierDetector
     /// Returns true when the request body matches the classifier signature:
     /// the system array contains both a block starting with
     /// "x-anthropic-billing-header:" and one starting with "You are a security monitor".
+    /// Operates on an already-parsed <see cref="JsonElement"/> so the caller
+    /// pays for a single JSON parse, not two.
     /// </summary>
-    internal static bool IsClassifierRequest(string body)
+    internal static bool IsClassifierRequest(JsonElement root)
     {
-        if (string.IsNullOrWhiteSpace(body))
+        if (root.ValueKind != JsonValueKind.Object)
             return false;
 
-        try
+        if (!root.TryGetProperty("system", out var system) || system.ValueKind != JsonValueKind.Array)
+            return false;
+
+        var hasBilling = false;
+        var hasMonitor = false;
+
+        foreach (var block in system.EnumerateArray())
         {
-            var json = JsonNode.Parse(body);
-            var system = json?["system"];
-            if (system is not JsonArray arr)
-                return false;
+            if (block.ValueKind != JsonValueKind.Object)
+                continue;
+            if (!block.TryGetProperty("text", out var text) || text.ValueKind != JsonValueKind.String)
+                continue;
 
-            var hasBilling = false;
-            var hasMonitor = false;
+            var value = text.GetString();
+            if (value is null)
+                continue;
 
-            foreach (var block in arr)
-            {
-                var text = block?["text"]?.GetValue<string>();
-                if (text is null)
-                    continue;
+            if (value.StartsWith("x-anthropic-billing-header:", StringComparison.Ordinal))
+                hasBilling = true;
+            if (value.StartsWith("You are a security monitor", StringComparison.Ordinal))
+                hasMonitor = true;
 
-                if (text.StartsWith("x-anthropic-billing-header:", StringComparison.Ordinal))
-                    hasBilling = true;
-                if (text.StartsWith("You are a security monitor", StringComparison.Ordinal))
-                    hasMonitor = true;
-
-                if (hasBilling && hasMonitor)
-                    return true;
-            }
-
-            return false;
+            if (hasBilling && hasMonitor)
+                return true;
         }
-        catch
-        {
-            // Not valid JSON or unexpected structure — not a classifier
-            return false;
-        }
+
+        return false;
     }
 }

@@ -22,7 +22,15 @@ internal sealed class ComplianceLogWriter : BackgroundService
         });
     }
 
-    public bool TryWrite(ComplianceEntry entry) => _channel.Writer.TryWrite(entry);
+    /// <summary>
+    /// Whether compliance logging is enabled. When disabled, <see cref="TryWrite"/>
+    /// is a no-op so the bounded channel never accumulates full request/response
+    /// bodies in memory (the background reader stops draining when disabled).
+    /// </summary>
+    public bool IsEnabled => _options.Enabled;
+
+    public bool TryWrite(ComplianceEntry entry) =>
+        _options.Enabled && _channel.Writer.TryWrite(entry);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

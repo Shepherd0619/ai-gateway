@@ -45,14 +45,17 @@ This is a lightweight reverse proxy that spoofs Anthropic model discovery and re
 1. **Model discovery** — `GET /v1/models` (`Discovery/ModelDiscoveryEndpoints.cs`) returns a hardcoded Claude-flavored model list so the client tool trusts the available models.
 2. **Proxy** — `POST /v1/{**catchAll}` (`Proxy/ProxyHandler.cs`) does the core work:
    - Extracts API key from `x-api-key` (desktop) or `Authorization: Bearer` (CLI) → returns 401 if missing
-   - Parses JSON body, detects client's `"stream": true/false` preference
+   - Reads the request body as raw UTF-8 bytes and parses it once with `JsonDocument` (zero-copy over the bytes); detects the client's `"stream": true/false` preference from the top-level `stream` field
    - **Classifier detection** examines the `system` array for auto-mode classifier signatures and routes matching requests to `Classifier:TargetModel` instead of the main model
    - **Model rewriting** maps `model` field via `ModelMapper` (prefix-based, first-match-wins)
-   - **Non-streaming** (default or `stream: false`): forces `stream: false`, reads full upstream response, rewrites model name back in JSON body, sends as single response
+   - Re-serializes the body only when it actually changed (model rewrite / classifier strip), streaming it through `Utf8JsonWriter` and copying untouched fields verbatim via `JsonElement.WriteTo`. Unchanged bodies are forwarded byte-for-byte.
+   - **Non-streaming** (default or `stream: false`): reads full upstream response as bytes, rewrites model name back in the JSON body, sends as single response
    - **Streaming** (`stream: true`): passes `stream: true` through to upstream, streams SSE response line-by-line, rewrites model name in `data:` lines, flushes after each blank-line SSE event boundary
    - Forwards to the configured upstream (`Upstream:BaseUrl`) with `Authorization: Bearer` and `anthropic-version` headers
-   - Writes a compliance log entry (if enabled) via a non-blocking `Channel<T>.TryWrite`
+   - Writes a compliance log entry (only if enabled) via a non-blocking `Channel<T>.TryWrite`
    - Log messages include a `[classifier]` role tag for classifier-routed requests
+
+   The request/response bodies are held as bytes (not a `string` → `JsonNode` DOM → re-serialized `string`), so a large body is buffered ~2× instead of ~5–6× — this avoids `OutOfMemoryException` under tight container memory limits.
 
 ### SSE streaming (`Proxy/ProxyHandler.cs` → `StreamSseResponse`)
 

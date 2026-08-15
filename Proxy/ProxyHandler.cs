@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using AiGateway.Compliance;
 
 namespace AiGateway.Proxy;
@@ -53,104 +52,85 @@ internal sealed class ProxyHandler
             return;
         }
 
-        // 2. Read request body
-        using var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8, leaveOpen: true);
-        var body = await reader.ReadToEndAsync(ctx.RequestAborted);
+        // 2. Read request body as raw UTF-8 bytes — a single buffered copy, no
+        //    intermediate string.  (Previous approach read a UTF-16 string, parsed
+        //    a JsonNode DOM, and re-serialized to another string, holding ~5-6 full
+        //    copies in memory and OOM-ing under a tight container memory limit.)
+        using var bodyStream = new MemoryStream();
+        await ctx.Request.Body.CopyToAsync(bodyStream, ctx.RequestAborted);
+        var bodyBytes = bodyStream.ToArray();
 
-        // 3. Rewrite model + handle streaming preference
+        // 3. Rewrite model + detect streaming preference in a single zero-copy parse.
         string? originalModel = null;
         string? upstreamModel = null;
         string? role = null;
         string? proxyServer = null;
-        var bodyToSend = body;
+        byte[] bodyToSend = bodyBytes;
         var contentType = ctx.Request.ContentType ?? "application/json";
         bool clientWantsStream = false;
 
-        if (!string.IsNullOrEmpty(body) && body.TrimStart().StartsWith('{'))
+        if (bodyBytes.Length > 0)
         {
             try
             {
-                var json = JsonNode.Parse(body);
-                if (json is not null)
-                {
-                    // Detect client streaming preference before we force it
-                    if (json["stream"] is JsonValue streamNode)
-                        clientWantsStream = streamNode.GetValueKind() == JsonValueKind.True;
+                using var doc = JsonDocument.Parse(bodyBytes);
+                var root = doc.RootElement;
 
-                    // Force non-streaming only if the client didn't request it
-                    if (!clientWantsStream)
-                        json["stream"] = false;
+                if (root.ValueKind == JsonValueKind.Object)
+                {
+                    // Detect client streaming preference from the top-level "stream" field.
+                    // We no longer force stream:false — upstream defaults to non-streaming.
+                    if (root.TryGetProperty("stream", out var streamEl) && streamEl.ValueKind == JsonValueKind.True)
+                        clientWantsStream = true;
 
                     // ── Classifier detection ──
                     // Auto-mode security classifier requests are short safety checks.
                     // Route them to a faster model (e.g. deepseek-v4-flash) so they
                     // stay responsive even when the main model is slow or unavailable.
-                    var isClassifier = _classifierTargetModel is not null && ClassifierDetector.IsClassifierRequest(body);
-                    if (_classifierTargetModel is not null)
-                    {
-                        // Diagnostic: log system prompt structure to help debug classifier detection
-                        var sysNode = json["system"];
-                        if (sysNode is JsonArray arr)
-                        {
-                            var previews = new List<string>();
-                            foreach (var block in arr)
-                            {
-                                var text = block?["text"]?.GetValue<string>();
-                                if (text is not null)
-                                    previews.Add(text.Length > 80 ? text[..80] + "…" : text);
-                            }
-                            _logger.LogDebug("DIAG classifier system array[{Count}]: texts={Previews} isClassifier={IsClassifier}",
-                                arr.Count, string.Join(" | ", previews), isClassifier);
-                        }
-                        else if (sysNode is not null)
-                        {
-                            _logger.LogDebug("DIAG classifier system is {Type}, not JsonArray — skipping detection", sysNode.GetType().Name);
-                        }
-                    }
+                    var isClassifier = _classifierTargetModel is not null && ClassifierDetector.IsClassifierRequest(root);
+
+                    string? newModel = null;
                     if (isClassifier)
                     {
                         role = "classifier";
-                        originalModel = json["model"]?.GetValue<string>() ?? "claude-sonnet-4-20250514";
+                        originalModel = GetModel(root) ?? "claude-sonnet-4-20250514";
                         upstreamModel = _classifierTargetModel;
-                        json["model"] = upstreamModel;
-
-                        // Strip x-anthropic-billing-header block — Anthropic-internal metadata not needed by upstream
-                        if (json["system"] is JsonArray systemArr)
-                        {
-                            var toRemove = new List<JsonNode?>();
-                            foreach (var block in systemArr)
-                            {
-                                var text = block?["text"]?.GetValue<string>();
-                                if (text is not null && text.StartsWith("x-anthropic-billing-header:", StringComparison.Ordinal))
-                                    toRemove.Add(block);
-                            }
-                            foreach (var block in toRemove)
-                                systemArr.Remove(block);
-                            if (toRemove.Count > 0)
-                                _logger.LogDebug("Stripped {Count} billing-header block(s) from classifier request", toRemove.Count);
-                        }
-
-                        _logger.LogDebug("Classifier request detected, routing to {TargetModel}", upstreamModel);
+                        newModel = _classifierTargetModel;
+                        LogClassifierDiagnostics(root, isClassifier);
                     }
-                    else if (json["model"] is JsonValue modelNode && modelNode.TryGetValue(out string? model))
+                    else if (GetModel(root) is { } model)
                     {
                         originalModel = model;
-                        var mapResult = _mapper.Map(originalModel);
+                        var mapResult = _mapper.Map(model);
                         upstreamModel = mapResult.TargetModel;
                         proxyServer = mapResult.ProxyServer;
-                        if (upstreamModel != originalModel)
-                        {
-                            json["model"] = upstreamModel;
-                        }
+                        if (upstreamModel != model)
+                            newModel = upstreamModel;
                     }
-                    bodyToSend = json.ToJsonString();
+
+                    // Re-serialize only when we actually changed something (model rewrite
+                    // or classifier system-strip).  Otherwise forward the original bytes
+                    // untouched, avoiding a full re-encode of the body.
+                    if (newModel is not null)
+                    {
+                        using var outStream = new MemoryStream();
+                        using (var writer = new Utf8JsonWriter(outStream))
+                        {
+                            WriteTransformed(writer, root, newModel, isClassifier);
+                        }
+                        bodyToSend = outStream.ToArray();
+                    }
                 }
             }
-            catch (System.Text.Json.JsonException)
+            catch (JsonException)
             {
-                // Body isn't valid JSON — forward as-is
+                // Body isn't valid JSON — forward raw bytes as-is
             }
         }
+
+        // Compliance log records the *original* client body.  Decode it only when
+        // compliance logging is enabled (otherwise the bytes are never needed again).
+        var requestBody = _complianceWriter.IsEnabled ? Encoding.UTF8.GetString(bodyBytes) : string.Empty;
 
         // 4. Build and send upstream request
         var fullUrl = _upstreamBaseUrl + path;
@@ -160,16 +140,20 @@ internal sealed class ProxyHandler
         var client = _hcf.CreateClient(httpClientName);
         using var upstreamReq = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), fullUrl)
         {
-            Content = new StringContent(bodyToSend, Encoding.UTF8, contentType)
+            Content = new ByteArrayContent(bodyToSend)
         };
+        upstreamReq.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
         upstreamReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {clientKey}");
 
         var anthropicVersion = ctx.Request.Headers["anthropic-version"].FirstOrDefault() ?? "2023-06-01";
         upstreamReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion);
 
-        _logger.LogDebug("DIAG upstream req {Method} {FullUrl} originalModel={Orig} upstreamModel={Up} bodyLen={BodyLen} body={Body}",
-            ctx.Request.Method, fullUrl, originalModel, upstreamModel, bodyToSend.Length,
-            bodyToSend.Length > 500 ? bodyToSend[..500] : bodyToSend);
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            var preview = bodyToSend.Length > 500 ? Encoding.UTF8.GetString(bodyToSend, 0, 500) : Encoding.UTF8.GetString(bodyToSend);
+            _logger.LogDebug("DIAG upstream req {Method} {FullUrl} originalModel={Orig} upstreamModel={Up} bodyLen={BodyLen} body={Body}",
+                ctx.Request.Method, fullUrl, originalModel, upstreamModel, bodyToSend.Length, preview);
+        }
 
         var sw = Stopwatch.StartNew();
         HttpResponseMessage upstreamResp;
@@ -196,13 +180,13 @@ internal sealed class ProxyHandler
         {
             if (clientWantsStream && upstreamResp.IsSuccessStatusCode)
             {
-                await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw, role);
+                await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, role);
             }
             else
             {
                 try
                 {
-                    await HandleNonStreaming(ctx, upstreamResp, originalModel, upstreamModel, body, path, sw, role);
+                    await HandleNonStreaming(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, role);
                 }
                 catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
                 {
@@ -212,6 +196,72 @@ internal sealed class ProxyHandler
                 }
             }
         }
+    }
+
+    private static string? GetModel(JsonElement root) =>
+        root.TryGetProperty("model", out var model) && model.ValueKind == JsonValueKind.String
+            ? model.GetString()
+            : null;
+
+    private void LogClassifierDiagnostics(JsonElement root, bool isClassifier)
+    {
+        if (!root.TryGetProperty("system", out var system) || system.ValueKind != JsonValueKind.Array)
+            return;
+
+        var previews = new List<string>();
+        foreach (var block in system.EnumerateArray())
+        {
+            if (block.ValueKind == JsonValueKind.Object
+                && block.TryGetProperty("text", out var text)
+                && text.ValueKind == JsonValueKind.String
+                && text.GetString() is { } value)
+            {
+                previews.Add(value.Length > 80 ? value[..80] + "…" : value);
+            }
+        }
+        _logger.LogDebug("DIAG classifier system array[{Count}]: texts={Previews} isClassifier={IsClassifier}",
+            previews.Count, string.Join(" | ", previews), isClassifier);
+    }
+
+    // Re-serializes the request body with the model rewritten and (for classifier
+    // requests) the x-anthropic-billing-header system block stripped.  Every other
+    // property is copied verbatim via JsonElement.WriteTo, so only the mutated spots
+    // are touched.  Root is guaranteed to be a JSON object by the caller.
+    private static void WriteTransformed(Utf8JsonWriter writer, JsonElement root, string newModel, bool stripBillingHeader)
+    {
+        writer.WriteStartObject();
+        foreach (var prop in root.EnumerateObject())
+        {
+            if (prop.NameEquals("model"))
+            {
+                writer.WriteString("model", newModel);
+            }
+            else if (stripBillingHeader && prop.NameEquals("system") && prop.Value.ValueKind == JsonValueKind.Array)
+            {
+                writer.WritePropertyName("system");
+                writer.WriteStartArray();
+                foreach (var block in prop.Value.EnumerateArray())
+                {
+                    if (!IsBillingHeaderBlock(block))
+                        block.WriteTo(writer);
+                }
+                writer.WriteEndArray();
+            }
+            else
+            {
+                writer.WritePropertyName(prop.Name);
+                prop.Value.WriteTo(writer);
+            }
+        }
+        writer.WriteEndObject();
+    }
+
+    private static bool IsBillingHeaderBlock(JsonElement block)
+    {
+        if (block.ValueKind != JsonValueKind.Object) return false;
+        if (!block.TryGetProperty("text", out var text) || text.ValueKind != JsonValueKind.String) return false;
+        var value = text.GetString();
+        return value is not null && value.StartsWith("x-anthropic-billing-header:", StringComparison.Ordinal);
     }
 
     private async Task HandleNonStreaming(
@@ -224,37 +274,52 @@ internal sealed class ProxyHandler
         Stopwatch sw,
         string? role)
     {
-        // Read upstream response (non-streaming or error)
-        var respBody = await upstreamResp.Content.ReadAsStringAsync(ctx.RequestAborted);
+        // Read upstream response as raw bytes (non-streaming or error).
+        var respBytes = await upstreamResp.Content.ReadAsByteArrayAsync(ctx.RequestAborted);
+        var respToSend = respBytes;
+        var needsRewrite = originalModel is not null && upstreamModel is not null && upstreamModel != originalModel;
 
         // ── Diagnostic logging ──
         if (upstreamResp.IsSuccessStatusCode)
-            _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
-                (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBody.Length,
-                respBody.Length > 500 ? respBody[..500] : respBody);
+        {
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                var preview = respBytes.Length > 500 ? Encoding.UTF8.GetString(respBytes, 0, 500) : Encoding.UTF8.GetString(respBytes);
+                _logger.LogDebug("DIAG upstream status={Status} content-type={ContentType} bodyLen={BodyLen} body={Body}",
+                    (int)upstreamResp.StatusCode, upstreamResp.Content.Headers.ContentType, respBytes.Length, preview);
+            }
+        }
         else
+        {
             _logger.LogInformation("DIAG upstream ERROR status={Status} body={Body}",
-                (int)upstreamResp.StatusCode, respBody.Length > 1000 ? respBody[..1000] : respBody);
+                (int)upstreamResp.StatusCode, respBytes.Length > 1000 ? Encoding.UTF8.GetString(respBytes, 0, 1000) : Encoding.UTF8.GetString(respBytes));
+        }
 
-        // Rewrite response model back (e.g. DeepSeek → original Claude name)
-        if (originalModel is not null && upstreamModel is not null && upstreamModel != originalModel)
+        // Rewrite response model back (e.g. DeepSeek → original Claude name).
+        if (needsRewrite && respBytes.Length > 0)
         {
             try
             {
-                var respJson = JsonNode.Parse(respBody);
-                if (respJson?["model"] is not null)
+                using var doc = JsonDocument.Parse(respBytes);
+                var root = doc.RootElement;
+                if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("model", out _))
                 {
-                    respJson["model"] = originalModel;
-                    respBody = respJson.ToJsonString();
+                    using var outStream = new MemoryStream();
+                    using (var writer = new Utf8JsonWriter(outStream))
+                    {
+                        WriteTransformed(writer, root, originalModel!, stripBillingHeader: false);
+                    }
+                    respToSend = outStream.ToArray();
                 }
             }
-            catch (System.Text.Json.JsonException)
+            catch (JsonException)
             {
                 // Response not valid JSON — forward as-is
             }
         }
 
-        // Compliance log (non-blocking via Channel)
+        // Compliance log (non-blocking via Channel).  Decode the response body only
+        // when logging is enabled, so it isn't materialized otherwise.
         _complianceWriter.TryWrite(new ComplianceEntry
         {
             Timestamp = DateTime.UtcNow.ToString("o"),
@@ -266,7 +331,7 @@ internal sealed class ProxyHandler
             StatusCode = (int)upstreamResp.StatusCode,
             DurationMs = sw.ElapsedMilliseconds,
             RequestBody = requestBody,
-            ResponseBody = respBody
+            ResponseBody = _complianceWriter.IsEnabled ? Encoding.UTF8.GetString(respBytes) : string.Empty
         });
 
         // Return proxied response
@@ -283,11 +348,10 @@ internal sealed class ProxyHandler
 
         ctx.Response.ContentType = upstreamResp.Content.Headers.ContentType?.ToString() ?? "application/json";
 
-        _logger.LogDebug("DIAG response content-type={ContentType} bodyLen={BodyLen} body={Body}",
-            ctx.Response.ContentType, respBody.Length,
-            respBody.Length > 500 ? respBody[..500] : respBody);
+        _logger.LogDebug("DIAG response content-type={ContentType} bodyLen={BodyLen}",
+            ctx.Response.ContentType, respToSend.Length);
 
-        await ctx.Response.WriteAsync(respBody, ctx.RequestAborted);
+        await ctx.Response.Body.WriteAsync(respToSend, 0, respToSend.Length, ctx.RequestAborted);
 
         _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms{Role}",
             ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
