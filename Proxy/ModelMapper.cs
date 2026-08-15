@@ -12,13 +12,24 @@ internal sealed class ModelMapper
 
     public MapResult Map(string model)
     {
-        foreach (var rule in _store.Rules)
+        var current = model;
+        string? proxyServer = null;
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        while (visited.Add(current))
         {
-            if (model.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
-                return new MapResult(
-                    string.IsNullOrEmpty(rule.Target) ? model : rule.Target,
-                    string.IsNullOrEmpty(rule.ProxyServer) ? null : rule.ProxyServer);
+            var rule = _store.Rules.FirstOrDefault(r =>
+                current.StartsWith(r.Prefix, StringComparison.OrdinalIgnoreCase));
+            if (rule is null)
+                break;
+
+            proxyServer ??= string.IsNullOrEmpty(rule.ProxyServer) ? null : rule.ProxyServer;
+            if (string.IsNullOrEmpty(rule.Target))
+                break;
+
+            current = rule.Target;
         }
-        return new MapResult(model, null);
+
+        return new MapResult(current, proxyServer);
     }
 }
