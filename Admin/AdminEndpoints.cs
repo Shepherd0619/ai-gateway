@@ -39,6 +39,7 @@ internal static class AdminEndpoints
         // GET /admin/mappings/{prefix} — get a single rule
         group.MapGet("/mappings/{prefix}", (RuntimeMappingStore store, string prefix) =>
         {
+            prefix = Uri.UnescapeDataString(prefix);
             var rule = store.Rules.FirstOrDefault(r =>
                 r.Prefix.Equals(prefix, StringComparison.OrdinalIgnoreCase));
             return rule is not null
@@ -66,6 +67,7 @@ internal static class AdminEndpoints
         // PATCH /admin/mappings/{prefix} — upsert a single rule
         group.MapPatch("/mappings/{prefix}", (RuntimeMappingStore store, string prefix, MappingRule? body) =>
         {
+            prefix = Uri.UnescapeDataString(prefix);
             if (body is null)
                 return Results.Json(new { error = "Request body is required" }, statusCode: 400);
 
@@ -88,6 +90,7 @@ internal static class AdminEndpoints
         // DELETE /admin/mappings/{prefix} — remove a runtime override
         group.MapDelete("/mappings/{prefix}", (RuntimeMappingStore store, string prefix) =>
         {
+            prefix = Uri.UnescapeDataString(prefix);
             store.Delete(prefix);
             return Results.NoContent();
         });
