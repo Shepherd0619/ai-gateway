@@ -1,3 +1,4 @@
+using AiGateway.Admin;
 using AiGateway.Compliance;
 using AiGateway.Configuration;
 using AiGateway.Discovery;
@@ -10,6 +11,7 @@ var builder = WebApplication.CreateSlimBuilder(args);
 builder.Services.Configure<ModelMappingOptions>(builder.Configuration.GetSection("ModelMapping"));
 builder.Services.Configure<ComplianceLogOptions>(builder.Configuration.GetSection("ComplianceLog"));
 builder.Services.Configure<CorsOptions>(builder.Configuration.GetSection("Cors"));
+builder.Services.Configure<AdminOptions>(builder.Configuration.GetSection("Admin"));
 
 // ── CORS ──
 var corsOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
@@ -74,6 +76,7 @@ if (mappingRules is not null && proxyServers is not null)
 }
 
 // ── Application services ──
+builder.Services.AddSingleton<RuntimeMappingStore>();
 builder.Services.AddSingleton<ModelMapper>();
 builder.Services.AddSingleton<ComplianceLogWriter>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ComplianceLogWriter>());
@@ -85,7 +88,7 @@ app.UseCors("browser");
 
 // ── Startup diagnostic ──
 var startupLogger = app.Services.GetRequiredService<ILogger<Program>>();
-var mapping = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ModelMappingOptions>>().Value;
+var mapping = app.Services.GetRequiredService<RuntimeMappingStore>();
 var corsOpts = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<CorsOptions>>().Value;
 startupLogger.LogInformation("Startup: upstream={Url}, origins=[{Origins}], rules=[{Rules}]",
     upstreamBaseUrl, string.Join(", ", corsOpts.AllowedOrigins),
@@ -97,6 +100,7 @@ startupLogger.LogInformation("Startup: upstream={Url}, origins=[{Origins}], rule
 // ── Endpoints ──
 app.MapHealthEndpoints();
 app.MapModelDiscoveryEndpoints();
+app.MapAdminEndpoints();
 app.Map("/v1/{**catchAll}", app.Services.GetRequiredService<ProxyHandler>().Invoke);
 
 app.Run();
