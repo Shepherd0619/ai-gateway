@@ -85,7 +85,7 @@ Rules come from `RuntimeMappingStore` (a singleton), which merges three sources 
 2. `mappings-runtime.json` — overrides persisted by the admin API
 3. Environment variables (e.g. `ModelMapping__Rules__0__Target`) — docker-compose overrides
 
-The merge is by `Prefix`: a runtime rule with the same `Prefix` as a base rule replaces it; base rules with no runtime override are kept. `ModelMapper.Map()` reads the store on every request, so changes take effect immediately with no restart.
+The merge is by `Prefix`: a runtime rule with the same `Prefix` as a base rule replaces it; base rules with no runtime override are kept. **Ordering is runtime-first**: the effective list is the runtime rules in array order (the admin UI reorders them via `PUT /admin/mappings`), followed by any base rules not overridden, in base order. This lets a more-specific runtime rule shadow a broader base catch-all. `ModelMapper.Map()` reads the store on every request, so changes take effect immediately with no restart.
 
 Each rule can optionally reference a `ProxyServer` to route requests through a SOCKS5 proxy — useful when the upstream enforces geo-restrictions on certain models.
 

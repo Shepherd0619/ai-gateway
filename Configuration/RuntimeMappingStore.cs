@@ -85,17 +85,26 @@ internal sealed class RuntimeMappingStore
 
     private List<MappingRule> Merge(List<MappingRule> runtimeRules)
     {
-        var merged = new Dictionary<string, MappingRule>(StringComparer.OrdinalIgnoreCase);
+        // Runtime rules are the authoritative, reorderable list and win by array order.
+        // Base rules act only as fallbacks: any prefix not present in the runtime list
+        // is appended afterwards in base order. This lets the admin freely reorder the
+        // effective list via PUT /admin/mappings (first-match-wins depends on this order).
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var merged = new List<MappingRule>(runtimeRules.Count + _baseRules.Count);
 
-        // Start with base rules (appsettings.json + env var overrides)
-        foreach (var rule in _baseRules)
-            merged[rule.Prefix] = rule;
-
-        // Overlay runtime rules by matching Prefix
         foreach (var rule in runtimeRules)
-            merged[rule.Prefix] = rule;
+        {
+            seen.Add(rule.Prefix);
+            merged.Add(rule);
+        }
 
-        return merged.Values.ToList();
+        foreach (var rule in _baseRules)
+        {
+            if (!seen.Contains(rule.Prefix))
+                merged.Add(rule);
+        }
+
+        return merged;
     }
 
     private List<MappingRule> LoadRuntimeRules()
