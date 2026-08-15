@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using AiGateway.Configuration;
 using Microsoft.Extensions.Options;
 
@@ -93,6 +94,48 @@ internal static class AdminEndpoints
             prefix = Uri.UnescapeDataString(prefix);
             store.Delete(prefix);
             return Results.NoContent();
+        });
+
+        // GET /admin/proxy-health — probe every configured ProxyServer for reachability
+        group.MapGet("/proxy-health", async (
+            IHttpClientFactory hcf,
+            IOptions<ProxyServerOptions> proxyOptions,
+            IConfiguration config,
+            CancellationToken ct) =>
+        {
+            var upstreamBaseUrl = config.GetValue<string>("Upstream:BaseUrl")
+                ?? "https://openrouter.ai/api";
+
+            var probes = proxyOptions.Value.Keys.Select(async name =>
+            {
+                var sw = Stopwatch.StartNew();
+                string status;
+                string? error = null;
+                try
+                {
+                    var client = hcf.CreateClient($"openrouter-proxy-{name}");
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    cts.CancelAfter(TimeSpan.FromSeconds(5));
+                    using var request = new HttpRequestMessage(HttpMethod.Head, upstreamBaseUrl);
+                    using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                    status = "healthy";
+                }
+                catch (Exception ex) when (ex is TaskCanceledException or OperationCanceledException)
+                {
+                    status = "unhealthy";
+                    error = "Upstream request timed out after 5s";
+                }
+                catch (Exception)
+                {
+                    status = "unhealthy";
+                    error = "Connection failed";
+                }
+                sw.Stop();
+
+                return new { name, status, latency_ms = sw.ElapsedMilliseconds, error };
+            });
+
+            return Results.Json(await Task.WhenAll(probes));
         });
     }
 }
