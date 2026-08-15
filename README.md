@@ -43,7 +43,7 @@ Because OpenRouter's `/api` base already speaks the Anthropic Messages format na
 | `claude-opus-4-20250514` | `deepseek/deepseek-v4-pro` |
 | `claude-*` (catch-all) | `deepseek/deepseek-v4-pro` |
 
-Rules are prefix-matched in order — the `claude-haiku` rule must come before the `claude` catch-all. Mappings are defined in `appsettings.json` and can be customized without code changes.
+Rules are prefix-matched in order — the `claude-haiku` rule must come before the `claude` catch-all. Mappings are defined in `appsettings.json` and can be customized without code changes, or changed at runtime via the [admin API](#runtime-model-mapping-admin-api) without restarting the gateway.
 
 ## Quick start
 
@@ -104,6 +104,8 @@ All settings live in `appsettings.json`.
 | `Classifier` | `TargetModel` | — | Fast model for auto-mode classifier requests (remove to disable) |
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
 | `ComplianceLog` | `Path` | `/var/log/ai-gateway/compliance.log` | Where to write the compliance log |
+| `Admin` | `ApiKey` | — | API key protecting the admin API (unset disables it) |
+| `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted |
 | `Kestrel` | `Endpoints.Http.Url` | `http://0.0.0.0:4000` | Listen address and port |
 
 All settings can also be overridden with environment variables (e.g. `Upstream__BaseUrl`).
@@ -122,6 +124,50 @@ All settings can also be overridden with environment variables (e.g. `Upstream__
 }
 ```
 
+## Runtime model mapping (admin API)
+
+Model mappings can be changed at runtime without restarting the gateway. Changes take effect immediately and persist to `mappings-runtime.json`, which survives container redeploys when mounted as a volume.
+
+Enable the admin API by setting an API key:
+
+```json
+{
+  "Admin": {
+    "ApiKey": "sk-admin-your-secret",
+    "RuntimeConfigPath": "mappings-runtime.json"
+  }
+}
+```
+
+Or via environment variable `Admin__ApiKey`. When no key is set, the admin API is disabled and returns `404`.
+
+All admin endpoints require the `x-admin-key` header:
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/mappings` | List all effective rules (merged view) |
+| `GET` | `/admin/mappings/{prefix}` | Get a single rule |
+| `PUT` | `/admin/mappings` | Replace all runtime rules |
+| `PATCH` | `/admin/mappings/{prefix}` | Upsert a single rule |
+| `DELETE` | `/admin/mappings/{prefix}` | Remove a runtime override (fall back to default) |
+
+```bash
+# List rules
+curl http://localhost:4000/admin/mappings -H "x-admin-key: sk-admin-your-secret"
+
+# Change the `claude` catch-all to a different model
+curl -X PATCH http://localhost:4000/admin/mappings/claude \
+  -H "x-admin-key: sk-admin-your-secret" \
+  -H "content-type: application/json" \
+  -d '{"target":"openai/gpt-5","proxyServer":null}'
+
+# Remove the override (fall back to appsettings.json default)
+curl -X DELETE http://localhost:4000/admin/mappings/claude \
+  -H "x-admin-key: sk-admin-your-secret"
+```
+
+**Persistence in Docker:** the runtime config path must be a writable volume mount, e.g. `Admin__RuntimeConfigPath=/data/mappings-runtime.json` with `-v ./data:/data`. The distroless container's `/app` directory is not guaranteed writable.
+
 ## Health check
 
 ```
@@ -139,9 +185,13 @@ ai-gateway/
 │   ├── ProxyHandler.cs             # Core proxy logic: auth, classifier detection, model rewrite, forwarding
 │   ├── ModelMapper.cs              # Prefix-based model name mapping
 │   └── ClassifierDetector.cs       # Detects auto-mode classifier requests by system-prompt signature
+├── Admin/
+│   └── AdminEndpoints.cs           # /admin/mappings CRUD + x-admin-key auth
 ├── Configuration/
 │   ├── MappingRule.cs              # Record: Prefix → Target
 │   ├── ModelMappingOptions.cs      # Record: list of MappingRules
+│   ├── AdminOptions.cs             # Record: admin API key + runtime config path
+│   ├── RuntimeMappingStore.cs      # Merged base + runtime rules, file persistence
 │   └── ComplianceLogOptions.cs     # Record: log toggles
 ├── Discovery/
 │   └── ModelDiscoveryEndpoints.cs  # GET /v1/models — spoofed Claude model list

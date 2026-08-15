@@ -74,7 +74,15 @@ Both must be present in the `system` array. When detected, the request is routed
 
 ### Model mapping (`Proxy/ModelMapper.cs`)
 
-Prefix-based, first-match-wins. Rules come from `appsettings.json` → `ModelMapping:Rules` and are evaluated in order. The `claude-haiku` rule must appear before the `claude` catch-all. No regex — just `string.StartsWith`.
+Prefix-based, first-match-wins. Rules are evaluated in order. The `claude-haiku` rule must appear before the `claude` catch-all. No regex — just `string.StartsWith`.
+
+Rules come from `RuntimeMappingStore` (a singleton), which merges three sources at startup — highest priority wins:
+
+1. `appsettings.json` → `ModelMapping:Rules` — base rules (committed to git)
+2. `mappings-runtime.json` — overrides persisted by the admin API
+3. Environment variables (e.g. `ModelMapping__Rules__0__Target`) — docker-compose overrides
+
+The merge is by `Prefix`: a runtime rule with the same `Prefix` as a base rule replaces it; base rules with no runtime override are kept. `ModelMapper.Map()` reads the store on every request, so changes take effect immediately with no restart.
 
 Each rule can optionally reference a `ProxyServer` to route requests through a SOCKS5 proxy — useful when the upstream enforces geo-restrictions on certain models.
 
@@ -104,6 +112,26 @@ When OpenRouter blocks models in your region, you can route specific model prefi
 - Proxy failures are hard errors — no fallback to direct.
 - SSE streaming works transparently through the proxy.
 
+### Admin API (`Admin/AdminEndpoints.cs` + `Configuration/RuntimeMappingStore.cs`)
+
+Model mapping rules can be changed at runtime via a REST API under `/admin`, protected by a fixed API key in the `x-admin-key` header (`Admin:ApiKey`).
+
+Endpoints:
+
+- `GET /admin/mappings` — list all effective rules (merged view)
+- `GET /admin/mappings/{prefix}` — get a single rule
+- `PUT /admin/mappings` — replace all runtime rules
+- `PATCH /admin/mappings/{prefix}` — upsert a single rule (prefix from URL takes precedence over body)
+- `DELETE /admin/mappings/{prefix}` — remove a runtime override (falls back to base rule)
+
+Key behaviors:
+
+- `RuntimeMappingStore.Save/Upsert/Delete` write to `mappings-runtime.json` (path from `Admin:RuntimeConfigPath`, default `mappings-runtime.json`), then atomically swap the in-memory merged view (`volatile IReadOnlyList<MappingRule>`). Proxy reads are lock-free.
+- No API key configured (`Admin:ApiKey` null/empty) → admin API disabled, `/admin/*` returns 404 (endpoint existence not leaked).
+- Invalid `ProxyServer` reference → 400 with the name of the undefined proxy server.
+- `mappings-runtime.json` is git-ignored and never written back to `appsettings.json`. To "promote" a runtime change to a default, edit `appsettings.json` manually.
+- Docker: set `Admin__RuntimeConfigPath` to a writable volume mount (the chiseled `/app` dir is not guaranteed writable).
+
 ### CORS
 
 A browser CORS policy is configured via `appsettings.json` → `Cors:AllowedOrigins` (array of origin strings, e.g. `["https://pivot.claude.ai"]`). Applied as middleware in `Program.cs`. Configured in `Configuration/CorsOptions.cs`.
@@ -118,6 +146,8 @@ A browser CORS policy is configured via `appsettings.json` → `Cors:AllowedOrig
 ### Configuration pattern
 
 Uses `IOptions<T>` with records (not classes with setters). All settings overridable via env vars with the `__` separator (e.g. `Upstream__BaseUrl`).
+
+The exception is model mapping rules, which are mutable at runtime via `RuntimeMappingStore` (a singleton holding a `volatile` merged view, not a static `IOptions` snapshot).
 
 ### Compliance logging (`Compliance/`)
 
