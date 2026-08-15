@@ -64,17 +64,13 @@ internal static class AdminEndpoints
         });
 
         // PATCH /admin/mappings/{prefix} — upsert a single rule
-        group.MapPatch("/mappings/{prefix}", (RuntimeMappingStore store, string prefix, MappingRule body) =>
+        group.MapPatch("/mappings/{prefix}", (RuntimeMappingStore store, string prefix, MappingRule? body) =>
         {
+            if (body is null)
+                return Results.Json(new { error = "Request body is required" }, statusCode: 400);
+
             // Prefix from URL path takes precedence over body
             var rule = body with { Prefix = prefix };
-
-            if (string.IsNullOrEmpty(rule.Target))
-            {
-                return Results.Json(
-                    new { error = "Target is required" },
-                    statusCode: 400);
-            }
 
             try
             {
