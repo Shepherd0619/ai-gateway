@@ -1,5 +1,4 @@
 using AiGateway.Configuration;
-using Microsoft.Extensions.Options;
 
 namespace AiGateway.Proxy;
 
@@ -7,13 +6,13 @@ internal record MapResult(string TargetModel, string? ProxyServer);
 
 internal sealed class ModelMapper
 {
-    private readonly ModelMappingOptions _mapping;
+    private readonly RuntimeMappingStore _store;
 
-    public ModelMapper(IOptions<ModelMappingOptions> options) => _mapping = options.Value;
+    public ModelMapper(RuntimeMappingStore store) => _store = store;
 
     public MapResult Map(string model)
     {
-        foreach (var rule in _mapping.Rules)
+        foreach (var rule in _store.Rules)
         {
             if (model.StartsWith(rule.Prefix, StringComparison.OrdinalIgnoreCase))
                 return new MapResult(
