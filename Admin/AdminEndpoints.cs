@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using AiGateway.Configuration;
+using AiGateway.Proxy;
 using Microsoft.Extensions.Options;
 
 namespace AiGateway.Admin;
@@ -96,6 +97,27 @@ internal static class AdminEndpoints
             return Results.NoContent();
         });
 
+        // GET /admin/classifier — return the effective classifier route and evaluated mapping.
+        group.MapGet("/classifier", (RuntimeClassifierStore classifier, ModelMapper mapper) =>
+            Results.Json(BuildClassifierView(classifier.Snapshot, mapper)));
+
+        // PUT /admin/classifier — save a runtime classifier override. Empty means disabled.
+        group.MapPut("/classifier", (RuntimeClassifierStore classifier, ModelMapper mapper, ClassifierRequest? request) =>
+        {
+            if (request is null)
+                return Results.Json(new { error = "Request body is required" }, statusCode: 400);
+
+            var snapshot = classifier.Save(request.TargetModel);
+            return Results.Json(BuildClassifierView(snapshot, mapper));
+        });
+
+        // DELETE /admin/classifier — remove the runtime override and restore base.
+        group.MapDelete("/classifier", (RuntimeClassifierStore classifier) =>
+        {
+            classifier.Delete();
+            return Results.NoContent();
+        });
+
         // GET /admin/proxy-health — probe every configured ProxyServer for reachability
         group.MapGet("/proxy-health", async (
             IHttpClientFactory hcf,
@@ -138,4 +160,29 @@ internal static class AdminEndpoints
             return Results.Json(await Task.WhenAll(probes));
         });
     }
+
+    private static object BuildClassifierView(ClassifierSnapshot snapshot, ModelMapper mapper)
+    {
+        if (!snapshot.Enabled)
+        {
+            return new
+            {
+                targetModel = (string?)null,
+                source = snapshot.Source,
+                evaluatedTargetModel = (string?)null,
+                evaluatedProxyServer = (string?)null,
+            };
+        }
+
+        var result = mapper.Map(snapshot.TargetModel!);
+        return new
+        {
+            targetModel = snapshot.TargetModel,
+            source = snapshot.Source,
+            evaluatedTargetModel = result.TargetModel,
+            evaluatedProxyServer = result.ProxyServer,
+        };
+    }
+
+    private sealed record ClassifierRequest(string? TargetModel);
 }

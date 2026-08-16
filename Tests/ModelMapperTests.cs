@@ -171,4 +171,58 @@ public sealed class ModelMapperTests
 
         Assert.Equal("openai/general", result.TargetModel);
     }
+
+    [Fact]
+    public void ClassifierStore_UsesBaseAndRestoresAfterRuntimeDelete()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".json");
+        var admin = Options.Create(new AdminOptions { RuntimeConfigPath = path });
+        var store = new RuntimeClassifierStore(
+            Options.Create(new ClassifierOptions { TargetModel = "base/model" }),
+            admin,
+            NullLogger<RuntimeClassifierStore>.Instance);
+
+        try
+        {
+            Assert.Equal("base/model", store.Snapshot.TargetModel);
+            Assert.Equal("base", store.Snapshot.Source);
+
+            store.Save(" third-party/model ");
+            Assert.Equal("third-party/model", store.Snapshot.TargetModel);
+            Assert.Equal("runtime", store.Snapshot.Source);
+
+            store.Delete();
+            Assert.Equal("base/model", store.Snapshot.TargetModel);
+            Assert.Equal("base", store.Snapshot.Source);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+            var classifierPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, "classifier-runtime.json");
+            if (File.Exists(classifierPath)) File.Delete(classifierPath);
+        }
+    }
+
+    [Fact]
+    public void ClassifierStore_NormalizesEmptyTargetToDisabledRuntimeSnapshot()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".json");
+        var store = new RuntimeClassifierStore(
+            Options.Create(new ClassifierOptions { TargetModel = "base/model" }),
+            Options.Create(new AdminOptions { RuntimeConfigPath = path }),
+            NullLogger<RuntimeClassifierStore>.Instance);
+
+        try
+        {
+            store.Save("   ");
+            Assert.Null(store.Snapshot.TargetModel);
+            Assert.False(store.Snapshot.Enabled);
+            Assert.Equal("runtime", store.Snapshot.Source);
+        }
+        finally
+        {
+            var classifierPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, "classifier-runtime.json");
+            if (File.Exists(classifierPath)) File.Delete(classifierPath);
+        }
+    }
 }
