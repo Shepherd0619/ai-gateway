@@ -5,3 +5,4 @@ obj/
 *.user
 *.suo
 mappings-runtime.json
+classifier-runtime.json

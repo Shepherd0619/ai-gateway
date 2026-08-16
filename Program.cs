@@ -9,6 +9,7 @@ var builder = WebApplication.CreateSlimBuilder(args);
 
 // ── Bind configuration ──
 builder.Services.Configure<ModelMappingOptions>(builder.Configuration.GetSection("ModelMapping"));
+builder.Services.Configure<ClassifierOptions>(builder.Configuration.GetSection("Classifier"));
 builder.Services.Configure<ComplianceLogOptions>(builder.Configuration.GetSection("ComplianceLog"));
 builder.Services.Configure<CorsOptions>(builder.Configuration.GetSection("Cors"));
 builder.Services.Configure<AdminOptions>(builder.Configuration.GetSection("Admin"));
@@ -77,6 +78,7 @@ if (mappingRules is not null && proxyServers is not null)
 
 // ── Application services ──
 builder.Services.AddSingleton<RuntimeMappingStore>();
+builder.Services.AddSingleton<RuntimeClassifierStore>();
 builder.Services.AddSingleton<ModelMapper>();
 builder.Services.AddSingleton<ComplianceLogWriter>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ComplianceLogWriter>());

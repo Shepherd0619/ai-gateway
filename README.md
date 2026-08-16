@@ -105,7 +105,14 @@ All settings live in `appsettings.json`.
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
 | `ComplianceLog` | `Path` | `/var/log/ai-gateway/compliance.log` | Where to write the compliance log |
 | `Admin` | `ApiKey` | — | API key protecting the admin API (unset disables it) |
-| `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted |
+| `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted; classifier overrides are stored beside it as `classifier-runtime.json` |
+
+The admin UI harden/export action includes both `ModelMapping` and `Classifier:TargetModel`. The classifier target is evaluated through `ModelMapping` at runtime, so no separate classifier proxy setting is exported.
+
+The classifier admin endpoints are `GET/PUT/DELETE /admin/classifier`. An empty target disables the classifier-specific route and returns matching requests to ordinary model mapping.
+
+
+## Runtime model mapping (admin API)
 | `Kestrel` | `Endpoints.Http.Url` | `http://0.0.0.0:4000` | Listen address and port |
 
 All settings can also be overridden with environment variables (e.g. `Upstream__BaseUrl`).

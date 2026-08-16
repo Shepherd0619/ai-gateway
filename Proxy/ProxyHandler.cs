@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using AiGateway.Compliance;
+using AiGateway.Configuration;
 
 namespace AiGateway.Proxy;
 
@@ -12,24 +13,23 @@ internal sealed class ProxyHandler
     private readonly ModelMapper _mapper;
     private readonly ComplianceLogWriter _complianceWriter;
     private readonly string _upstreamBaseUrl;
-    private readonly string? _classifierTargetModel;
+    private readonly RuntimeClassifierStore _classifier;
 
     public ProxyHandler(
         IHttpClientFactory hcf,
         ILogger<ProxyHandler> logger,
         ModelMapper mapper,
         ComplianceLogWriter complianceWriter,
+        RuntimeClassifierStore classifier,
         IConfiguration configuration)
     {
         _hcf = hcf;
         _logger = logger;
         _mapper = mapper;
         _complianceWriter = complianceWriter;
+        _classifier = classifier;
         _upstreamBaseUrl = configuration.GetValue<string>("Upstream:BaseUrl")
             ?? "https://openrouter.ai/api";
-        _classifierTargetModel = configuration.GetValue<string?>("Classifier:TargetModel");
-        if (_classifierTargetModel is not null)
-            _logger.LogInformation("Classifier detection enabled, target model: {TargetModel}", _classifierTargetModel);
     }
 
     internal async Task Invoke(HttpContext ctx)
@@ -87,15 +87,18 @@ internal sealed class ProxyHandler
                     // Auto-mode security classifier requests are short safety checks.
                     // Route them to a faster model (e.g. deepseek-v4-flash) so they
                     // stay responsive even when the main model is slow or unavailable.
-                    var isClassifier = _classifierTargetModel is not null && ClassifierDetector.IsClassifierRequest(root);
+                    var classifierSnapshot = _classifier.Snapshot;
+                    var isClassifier = classifierSnapshot.Enabled && ClassifierDetector.IsClassifierRequest(root);
 
                     string? newModel = null;
                     if (isClassifier)
                     {
                         role = "classifier";
                         originalModel = GetModel(root) ?? "claude-sonnet-4-20250514";
-                        upstreamModel = _classifierTargetModel;
-                        newModel = _classifierTargetModel;
+                        var mapResult = _mapper.Map(classifierSnapshot.TargetModel!);
+                        upstreamModel = mapResult.TargetModel;
+                        proxyServer = mapResult.ProxyServer;
+                        newModel = upstreamModel;
                         LogClassifierDiagnostics(root, isClassifier);
                     }
                     else if (GetModel(root) is { } model)
