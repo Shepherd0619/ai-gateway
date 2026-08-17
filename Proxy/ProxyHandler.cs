@@ -32,6 +32,30 @@ internal sealed class ProxyHandler
             ?? "https://openrouter.ai/api";
     }
 
+    internal static void ForwardClientIdentityHeaders(HttpRequest clientRequest, HttpRequestMessage upstreamRequest)
+    {
+        // Forward only headers that identify the downstream application/client.
+        // Gateway-controlled authentication and protocol headers stay authoritative.
+        string[] identityHeaders =
+        [
+            "User-Agent",
+            "X-Title",
+            "X-OpenRouter-Title",
+            "HTTP-Referer",
+            "Referer",
+            "X-Client-Name"
+        ];
+
+        foreach (var headerName in identityHeaders)
+        {
+            if (!clientRequest.Headers.TryGetValue(headerName, out var values) ||
+                upstreamRequest.Headers.Contains(headerName))
+                continue;
+
+            upstreamRequest.Headers.TryAddWithoutValidation(headerName, values.ToArray());
+        }
+    }
+
     internal async Task Invoke(HttpContext ctx)
     {
         var path = ctx.Request.Path.Value ?? "/";
@@ -150,6 +174,7 @@ internal sealed class ProxyHandler
 
         var anthropicVersion = ctx.Request.Headers["anthropic-version"].FirstOrDefault() ?? "2023-06-01";
         upstreamReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion);
+        ForwardClientIdentityHeaders(ctx.Request, upstreamReq);
 
         if (_logger.IsEnabled(LogLevel.Debug))
         {
