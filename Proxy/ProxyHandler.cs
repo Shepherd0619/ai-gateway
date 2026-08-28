@@ -304,7 +304,7 @@ internal sealed class ProxyHandler
     {
         // Read upstream response as raw bytes (non-streaming or error).
         var respBytes = await upstreamResp.Content.ReadAsByteArrayAsync(ctx.RequestAborted);
-        var respToSend = respBytes;
+        var respToSend = ErrorResponseNormalizer.Normalize(respBytes, !upstreamResp.IsSuccessStatusCode);
         var needsRewrite = originalModel is not null && upstreamModel is not null && upstreamModel != originalModel;
 
         // ── Diagnostic logging ──
