@@ -92,6 +92,7 @@ internal sealed class ProxyHandler
         byte[] bodyToSend = bodyBytes;
         var contentType = ctx.Request.ContentType ?? "application/json";
         bool clientWantsStream = false;
+        bool stripToolChoice = false;
 
         if (bodyBytes.Length > 0)
         {
@@ -135,15 +136,16 @@ internal sealed class ProxyHandler
                             newModel = upstreamModel;
                     }
 
-                    // Re-serialize only when we actually changed something (model rewrite
-                    // or classifier system-strip).  Otherwise forward the original bytes
-                    // untouched, avoiding a full re-encode of the body.
-                    if (newModel is not null)
+                    stripToolChoice = HasWebSearchTool(root) && root.TryGetProperty("tool_choice", out _);
+
+                    // Re-serialize only when we actually changed something (model rewrite,
+                    // classifier system-strip, or the OpenRouter web-search workaround).
+                    if (newModel is not null || stripToolChoice)
                     {
                         using var outStream = new MemoryStream();
                         using (var writer = new Utf8JsonWriter(outStream))
                         {
-                            WriteTransformed(writer, root, newModel, isClassifier);
+                            WriteTransformed(writer, root, newModel, isClassifier, stripToolChoice);
                         }
                         bodyToSend = outStream.ToArray();
                     }
@@ -255,14 +257,18 @@ internal sealed class ProxyHandler
     // requests) the x-anthropic-billing-header system block stripped.  Every other
     // property is copied verbatim via JsonElement.WriteTo, so only the mutated spots
     // are touched.  Root is guaranteed to be a JSON object by the caller.
-    private static void WriteTransformed(Utf8JsonWriter writer, JsonElement root, string newModel, bool stripBillingHeader)
+    internal static void WriteTransformed(Utf8JsonWriter writer, JsonElement root, string? newModel, bool stripBillingHeader, bool stripToolChoice = false)
     {
         writer.WriteStartObject();
         foreach (var prop in root.EnumerateObject())
         {
-            if (prop.NameEquals("model"))
+            if (prop.NameEquals("model") && newModel is not null)
             {
                 writer.WriteString("model", newModel);
+            }
+            else if (stripToolChoice && prop.NameEquals("tool_choice"))
+            {
+                continue;
             }
             else if (stripBillingHeader && prop.NameEquals("system") && prop.Value.ValueKind == JsonValueKind.Array)
             {
@@ -282,6 +288,26 @@ internal sealed class ProxyHandler
             }
         }
         writer.WriteEndObject();
+    }
+
+    internal static bool HasWebSearchTool(JsonElement root)
+    {
+        if (!root.TryGetProperty("tools", out var tools) || tools.ValueKind != JsonValueKind.Array)
+            return false;
+
+        foreach (var tool in tools.EnumerateArray())
+        {
+            if (tool.ValueKind != JsonValueKind.Object)
+                continue;
+            if (!tool.TryGetProperty("type", out var type) || type.ValueKind != JsonValueKind.String)
+                continue;
+
+            var toolType = type.GetString();
+            if (toolType is not null && toolType.StartsWith("web_search_", StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsBillingHeaderBlock(JsonElement block)
