@@ -14,8 +14,71 @@ public sealed class ModelMapperTests
             Options.Create(new ModelMappingOptions { Rules = rules.ToList() }),
             Options.Create(new AdminOptions { RuntimeConfigPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".json") }),
             Options.Create(new ProxyServerOptions()),
+            Options.Create(new BackendOptions
+            {
+                [BackendOptions.DefaultBackendName] = new BackendConfig { BaseUrl = "https://example/api" },
+                ["lmstudio"] = new BackendConfig { BaseUrl = "http://127.0.0.1:1234" },
+            }),
             NullLogger<RuntimeMappingStore>.Instance);
         return new ModelMapper(store);
+    }
+
+    [Fact]
+    public void Map_ReturnsExplicitBackendFromMatchingRule()
+    {
+        var mapper = CreateMapper(
+        [
+            new MappingRule { Prefix = "claude-local", Target = "local-model", Backend = "lmstudio" },
+        ]);
+
+        var result = mapper.Map("claude-local");
+
+        Assert.Equal("local-model", result.TargetModel);
+        Assert.Equal("lmstudio", result.Backend);
+    }
+
+    [Fact]
+    public void Map_DefaultsLegacyRuleToOpenRouter()
+    {
+        var mapper = CreateMapper(
+        [
+            new MappingRule { Prefix = "claude", Target = "remote-model" },
+        ]);
+
+        var result = mapper.Map("claude");
+
+        Assert.Equal("remote-model", result.TargetModel);
+        Assert.Equal(BackendOptions.DefaultBackendName, result.Backend);
+    }
+
+    [Fact]
+    public void Map_PreservesExplicitOpenRouterBackendAcrossChainedMappings()
+    {
+        var mapper = CreateMapper(
+        [
+            new MappingRule { Prefix = "claude", Target = "local/", Backend = "openrouter" },
+            new MappingRule { Prefix = "local/", Target = "loaded-model", Backend = "lmstudio" },
+        ]);
+
+        var result = mapper.Map("claude");
+
+        Assert.Equal("loaded-model", result.TargetModel);
+        Assert.Equal("openrouter", result.Backend);
+    }
+
+    [Fact]
+    public void Map_PreservesBackendAcrossChainedMappings()
+    {
+        var mapper = CreateMapper(
+        [
+            new MappingRule { Prefix = "claude-local", Target = "local/", Backend = "lmstudio" },
+            new MappingRule { Prefix = "local/", Target = "loaded-model" },
+        ]);
+
+        var result = mapper.Map("claude-local");
+
+        Assert.Equal("loaded-model", result.TargetModel);
+        Assert.Equal("lmstudio", result.Backend);
     }
 
     [Fact]

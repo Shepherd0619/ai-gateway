@@ -122,11 +122,10 @@ internal static class AdminEndpoints
         group.MapGet("/proxy-health", async (
             IHttpClientFactory hcf,
             IOptions<ProxyServerOptions> proxyOptions,
-            IConfiguration config,
+            IOptions<BackendOptions> backendOptions,
             CancellationToken ct) =>
         {
-            var upstreamBaseUrl = config.GetValue<string>("Upstream:BaseUrl")
-                ?? "https://openrouter.ai/api";
+            var upstreamBaseUrl = backendOptions.Value[BackendOptions.DefaultBackendName].BaseUrl;
 
             var probes = proxyOptions.Value.Keys.Select(async name =>
             {
@@ -135,7 +134,7 @@ internal static class AdminEndpoints
                 string? error = null;
                 try
                 {
-                    var client = hcf.CreateClient($"openrouter-proxy-{name}");
+                    var client = hcf.CreateClient($"backend-{BackendOptions.DefaultBackendName}-proxy-{name}");
                     using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                     cts.CancelAfter(TimeSpan.FromSeconds(5));
                     using var request = new HttpRequestMessage(HttpMethod.Head, upstreamBaseUrl);

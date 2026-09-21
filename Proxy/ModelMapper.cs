@@ -2,7 +2,7 @@ using AiGateway.Configuration;
 
 namespace AiGateway.Proxy;
 
-internal record MapResult(string TargetModel, string? ProxyServer);
+internal record MapResult(string TargetModel, string Backend, string? ProxyServer);
 
 internal sealed class ModelMapper
 {
@@ -13,6 +13,8 @@ internal sealed class ModelMapper
     public MapResult Map(string model)
     {
         var current = model;
+        var backend = BackendOptions.DefaultBackendName;
+        var backendSelected = false;
         string? proxyServer = null;
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -23,6 +25,12 @@ internal sealed class ModelMapper
             if (rule is null)
                 break;
 
+            if (!backendSelected && !string.IsNullOrEmpty(rule.Backend))
+            {
+                backend = rule.Backend;
+                backendSelected = true;
+            }
+
             proxyServer ??= string.IsNullOrEmpty(rule.ProxyServer) ? null : rule.ProxyServer;
             if (string.IsNullOrEmpty(rule.Target))
                 break;
@@ -30,6 +38,6 @@ internal sealed class ModelMapper
             current = rule.Target;
         }
 
-        return new MapResult(current, proxyServer);
+        return new MapResult(current, backend, proxyServer);
     }
 }

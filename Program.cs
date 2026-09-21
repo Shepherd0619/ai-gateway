@@ -22,59 +22,61 @@ builder.Services.AddCors(options =>
         policy.WithOrigins(corsOrigins).AllowAnyHeader().AllowAnyMethod());
 });
 
-// ── Upstream HTTP client ──
-var upstreamBaseUrl = builder.Configuration.GetValue<string>("Upstream:BaseUrl")
-    ?? "https://openrouter.ai/api";
+// ── Backend configuration and HTTP clients ──
+var configuredBackends = builder.Configuration.GetSection("Backends").Get<BackendOptions>() ?? new BackendOptions();
+var legacyBaseUrl = builder.Configuration.GetValue<string>("Upstream:BaseUrl") ?? "https://openrouter.ai/api";
+var backends = BackendConfiguration.Normalize(configuredBackends, legacyBaseUrl);
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IOptions<BackendOptions>>(
+    Microsoft.Extensions.Options.Options.Create(backends));
 
-builder.Services.AddHttpClient("openrouter", client =>
-{
-    client.BaseAddress = new Uri(upstreamBaseUrl);
-    client.Timeout = TimeSpan.FromMinutes(10);
-}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
-{
-    // Recycle connections every 5 minutes to pick up DNS changes and
-    // prevent stale connections from accumulating in the pool.
-    PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-    // Keep idle connections alive for 2 minutes to reduce TCP handshake
-    // overhead for bursty traffic patterns.
-    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-    // Enable multiple HTTP/2 connections to the same endpoint for
-    // concurrent streaming requests.
-    EnableMultipleHttp2Connections = true
-});
-
-// ── Proxy server HTTP clients ──
 builder.Services.Configure<ProxyServerOptions>(builder.Configuration.GetSection("ProxyServers"));
-var proxyServers = builder.Configuration.GetSection("ProxyServers").Get<ProxyServerOptions>();
-if (proxyServers is not null)
+var proxyServers = builder.Configuration.GetSection("ProxyServers").Get<ProxyServerOptions>() ?? new ProxyServerOptions();
+var mappingRules = builder.Configuration.GetSection("ModelMapping:Rules").Get<List<MappingRule>>() ?? [];
+BackendConfiguration.ValidateRules(mappingRules, backends);
+
+foreach (var (backendName, backendConfig) in backends)
 {
-    foreach (var (name, cfg) in proxyServers)
+    builder.Services.AddHttpClient($"backend-{backendName}", client =>
     {
-        builder.Services.AddHttpClient($"openrouter-proxy-{name}", client =>
+        client.BaseAddress = new Uri(backendConfig.BaseUrl);
+        client.Timeout = TimeSpan.FromMinutes(10);
+    }).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+        PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+        EnableMultipleHttp2Connections = true
+    });
+
+    foreach (var (proxyName, proxyConfig) in proxyServers)
+    {
+        builder.Services.AddHttpClient($"backend-{backendName}-proxy-{proxyName}", client =>
         {
-            client.BaseAddress = new Uri(upstreamBaseUrl);
+            client.BaseAddress = new Uri(backendConfig.BaseUrl);
             client.Timeout = TimeSpan.FromMinutes(10);
         }).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
         {
-            ConnectCallback = new Socks5ConnectCallback(cfg.Address).Connect
+            ConnectCallback = new Socks5ConnectCallback(proxyConfig.Address).Connect,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = true
         });
     }
 }
 
 // ── Validate ProxyServer references in mapping rules ──
-var mappingRules = builder.Configuration.GetSection("ModelMapping:Rules").Get<List<MappingRule>>();
-if (mappingRules is not null && proxyServers is not null)
+foreach (var rule in mappingRules)
 {
-    foreach (var rule in mappingRules)
+    if (!string.IsNullOrEmpty(rule.ProxyServer) && !proxyServers.ContainsKey(rule.ProxyServer))
     {
-        if (!string.IsNullOrEmpty(rule.ProxyServer) && !proxyServers.ContainsKey(rule.ProxyServer))
-        {
-            var criticalMsg = $"Configuration error: MappingRule '{rule.Prefix}' references ProxyServer '{rule.ProxyServer}' which is not defined in ProxyServers section.";
-            Console.Error.WriteLine(criticalMsg);
-            throw new InvalidOperationException(criticalMsg);
-        }
+        var criticalMsg = $"Configuration error: MappingRule '{rule.Prefix}' references ProxyServer '{rule.ProxyServer}' which is not defined in ProxyServers section.";
+        Console.Error.WriteLine(criticalMsg);
+        throw new InvalidOperationException(criticalMsg);
     }
 }
+
+var upstreamBaseUrl = backends[BackendOptions.DefaultBackendName].BaseUrl;
+
+// ── Application services ──
 
 // ── Application services ──
 builder.Services.AddSingleton<RuntimeMappingStore>();
