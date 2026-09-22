@@ -121,10 +121,9 @@ internal sealed class ProxyHandler
                     {
                         role = "classifier";
                         originalModel = GetModel(root) ?? "claude-sonnet-4-20250514";
-                        var mapResult = _mapper.Map(classifierSnapshot.TargetModel!);
-                        upstreamModel = mapResult.TargetModel;
-                        selectedBackend = mapResult.Backend;
-                        proxyServer = mapResult.ProxyServer;
+                        upstreamModel = classifierSnapshot.Target!;
+                        selectedBackend = classifierSnapshot.Backend;
+                        proxyServer = classifierSnapshot.ProxyServer;
                         newModel = upstreamModel;
                         LogClassifierDiagnostics(root, isClassifier);
                     }

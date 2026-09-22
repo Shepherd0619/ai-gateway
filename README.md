@@ -27,7 +27,7 @@ flowchart LR
 ```
 
 1. **Model discovery** — `GET /v1/models` returns a Claude-flavored model list so the client tool sees models it trusts.
-2. **Classifier detection** — Auto-mode security classifier requests are identified by their system-prompt signature and routed to a dedicated fast model (`Classifier:TargetModel`), bypassing the main model entirely.
+2. **Classifier detection** — Auto-mode security classifier requests are identified by their system-prompt signature and routed directly to the configured classifier route (`Classifier:Target` plus optional `Backend` and `ProxyServer`), bypassing ordinary model mapping entirely.
 3. **Model rewriting** — `claude-sonnet-4-20250514` in the request body becomes `deepseek/deepseek-v4-pro` before it hits OpenRouter. The response model name is rewritten back so the client never notices.
 4. **API key passthrough (BYOK)** — Both `x-api-key` (desktop) and `Authorization: Bearer` (CLI) headers are accepted. The key is forwarded as `Authorization: Bearer` upstream. You use your own OpenRouter key — no shared keys, no proxy-side auth.
 
@@ -99,17 +99,32 @@ All settings live in `appsettings.json`.
 
 | Section | Key | Default | Description |
 |---|---|---|---|
-| `ModelMapping` | `Rules` | — | Array of `{ "Prefix", "Target" }` objects for model name rewriting |
-| `Upstream` | `BaseUrl` | `https://openrouter.ai/api` | Upstream API base URL |
-| `Classifier` | `TargetModel` | — | Fast model for auto-mode classifier requests (remove to disable) |
+| `ModelMapping` | `Rules` | — | Array of `{ "Prefix", "Target", "Backend", "ProxyServer" }` objects for model routing and rewriting |
+| `Backends` | `<name>.BaseUrl` | `openrouter` / `https://openrouter.ai/api` | Named Anthropic-compatible upstream backends |
+| `Upstream` | `BaseUrl` | `https://openrouter.ai/api` | Legacy fallback used when `Backends.openrouter` is not configured |
+| `Classifier` | `Target`, `Backend`, `ProxyServer` | — | Dedicated route for auto-mode classifier requests; empty `Target` disables it |
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
 | `ComplianceLog` | `Path` | `/var/log/ai-gateway/compliance.log` | Where to write the compliance log |
 | `Admin` | `ApiKey` | — | API key protecting the admin API (unset disables it) |
 | `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted; classifier overrides are stored beside it as `classifier-runtime.json` |
 
-The admin UI harden/export action includes both `ModelMapping` and `Classifier:TargetModel`. The classifier target is evaluated through `ModelMapping` at runtime, so no separate classifier proxy setting is exported.
+The admin UI harden/export action includes both `ModelMapping` and the standalone `Classifier` route. Classifier routing is not evaluated through `ModelMapping` at runtime.
 
-The classifier admin endpoints are `GET/PUT/DELETE /admin/classifier`. An empty target disables the classifier-specific route and returns matching requests to ordinary model mapping.
+The classifier admin endpoints are `GET/PUT/DELETE /admin/classifier`. An empty `Target` disables the classifier-specific route and returns matching requests to ordinary model mapping.
+
+### Classifier configuration breaking change
+
+Classifier routing now uses the same route fields as model mappings:
+
+```json
+"Classifier": {
+  "Target": "deepseek/deepseek-v4-flash",
+  "Backend": "openrouter",
+  "ProxyServer": null
+}
+```
+
+`Classifier:TargetModel` is no longer supported. Classifier runtime overrides in `classifier-runtime.json` and `PUT /admin/classifier` use `Target`, `Backend`, and `ProxyServer`; existing `TargetModel` values must be migrated manually.
 
 
 ## Runtime model mapping (admin API)

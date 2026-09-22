@@ -34,6 +34,10 @@ internal static class AdminEndpoints
                 return await next(ctx);
             });
 
+        // GET /admin/backends — list configured backend names
+        group.MapGet("/backends", (IOptions<BackendOptions> options) =>
+            Results.Json(new { backends = options.Value.Keys }));
+
         // GET /admin/mappings — list all effective rules (merged view)
         group.MapGet("/mappings", (RuntimeMappingStore store) =>
             Results.Json(store.Rules));
@@ -97,18 +101,25 @@ internal static class AdminEndpoints
             return Results.NoContent();
         });
 
-        // GET /admin/classifier — return the effective classifier route and evaluated mapping.
-        group.MapGet("/classifier", (RuntimeClassifierStore classifier, ModelMapper mapper) =>
-            Results.Json(BuildClassifierView(classifier.Snapshot, mapper)));
+        // GET /admin/classifier — return the effective classifier route.
+        group.MapGet("/classifier", (RuntimeClassifierStore classifier) =>
+            Results.Json(BuildClassifierView(classifier.Snapshot)));
 
-        // PUT /admin/classifier — save a runtime classifier override. Empty means disabled.
-        group.MapPut("/classifier", (RuntimeClassifierStore classifier, ModelMapper mapper, ClassifierRequest? request) =>
+        // PUT /admin/classifier — save a runtime classifier override. Empty target disables it.
+        group.MapPut("/classifier", (RuntimeClassifierStore classifier, ClassifierOptions? request) =>
         {
             if (request is null)
                 return Results.Json(new { error = "Request body is required" }, statusCode: 400);
 
-            var snapshot = classifier.Save(request.TargetModel);
-            return Results.Json(BuildClassifierView(snapshot, mapper));
+            try
+            {
+                var snapshot = classifier.Save(request);
+                return Results.Json(BuildClassifierView(snapshot));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
         });
 
         // DELETE /admin/classifier — remove the runtime override and restore base.
@@ -160,28 +171,13 @@ internal static class AdminEndpoints
         });
     }
 
-    private static object BuildClassifierView(ClassifierSnapshot snapshot, ModelMapper mapper)
+    private static object BuildClassifierView(ClassifierSnapshot snapshot) => new
     {
-        if (!snapshot.Enabled)
-        {
-            return new
-            {
-                targetModel = (string?)null,
-                source = snapshot.Source,
-                evaluatedTargetModel = (string?)null,
-                evaluatedProxyServer = (string?)null,
-            };
-        }
+        target = snapshot.Enabled ? snapshot.Target : null,
+        backend = snapshot.Enabled ? snapshot.Backend : null,
+        proxyServer = snapshot.Enabled ? snapshot.ProxyServer : null,
+        source = snapshot.Source,
+    };
 
-        var result = mapper.Map(snapshot.TargetModel!);
-        return new
-        {
-            targetModel = snapshot.TargetModel,
-            source = snapshot.Source,
-            evaluatedTargetModel = result.TargetModel,
-            evaluatedProxyServer = result.ProxyServer,
-        };
-    }
 
-    private sealed record ClassifierRequest(string? TargetModel);
 }
