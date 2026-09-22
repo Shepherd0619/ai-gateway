@@ -46,7 +46,7 @@ This is a lightweight reverse proxy that spoofs Anthropic model discovery and re
 2. **Proxy** — `POST /v1/{**catchAll}` (`Proxy/ProxyHandler.cs`) does the core work:
    - Extracts API key from `x-api-key` (desktop) or `Authorization: Bearer` (CLI) → returns 401 if missing
    - Reads the request body as raw UTF-8 bytes and parses it once with `JsonDocument` (zero-copy over the bytes); detects the client's `"stream": true/false` preference from the top-level `stream` field
-   - **Classifier detection** examines the `system` array for auto-mode classifier signatures and routes matching requests to `Classifier:TargetModel` instead of the main model
+   - **Classifier detection** examines the `system` array for auto-mode classifier signatures and routes matching requests to the standalone `Classifier` route instead of the main model mapping
    - **Model rewriting** maps `model` field via `ModelMapper` (prefix-based, first-match-wins)
    - Re-serializes the body only when it actually changed (model rewrite / classifier strip), streaming it through `Utf8JsonWriter` and copying untouched fields verbatim via `JsonElement.WriteTo`. Unchanged bodies are forwarded byte-for-byte.
    - **Non-streaming** (default or `stream: false`): reads full upstream response as bytes, rewrites model name back in the JSON body, sends as single response
@@ -73,7 +73,7 @@ Claude Code auto-mode sends lightweight security-classifier requests before exec
 - A system block starting with `x-anthropic-billing-header:`
 - A system block starting with `You are a security monitor`
 
-Both must be present in the `system` array. When detected, the request is routed to `Classifier:TargetModel` (e.g. `deepseek-v4-flash`) instead of the main model. The Anthropic-internal `x-anthropic-billing-header` block is stripped before forwarding. Remove the `Classifier:TargetModel` config key to disable.
+Both must be present in the `system` array. When detected, the request is routed to `Classifier:Target` (with its optional `Backend` and `ProxyServer`) instead of the main model mapping. The Anthropic-internal `x-anthropic-billing-header` block is stripped before forwarding. Remove or empty `Classifier:Target` to disable.
 
 ### Model mapping (`Proxy/ModelMapper.cs`)
 

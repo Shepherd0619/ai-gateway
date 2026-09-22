@@ -1,6 +1,5 @@
 namespace AiGateway.Configuration;
 
-internal record ClassifierOptions
+internal record ClassifierOptions : ModelRoute
 {
-    public string? TargetModel { get; init; }
 }

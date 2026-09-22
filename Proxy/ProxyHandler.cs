@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using AiGateway.Compliance;
 using AiGateway.Configuration;
+using Microsoft.Extensions.Options;
 
 namespace AiGateway.Proxy;
 
@@ -12,7 +13,7 @@ internal sealed class ProxyHandler
     private readonly ILogger<ProxyHandler> _logger;
     private readonly ModelMapper _mapper;
     private readonly ComplianceLogWriter _complianceWriter;
-    private readonly string _upstreamBaseUrl;
+    private readonly BackendOptions _backends;
     private readonly RuntimeClassifierStore _classifier;
 
     public ProxyHandler(
@@ -21,15 +22,14 @@ internal sealed class ProxyHandler
         ModelMapper mapper,
         ComplianceLogWriter complianceWriter,
         RuntimeClassifierStore classifier,
-        IConfiguration configuration)
+        IOptions<BackendOptions> backendOptions)
     {
         _hcf = hcf;
         _logger = logger;
         _mapper = mapper;
         _complianceWriter = complianceWriter;
         _classifier = classifier;
-        _upstreamBaseUrl = configuration.GetValue<string>("Upstream:BaseUrl")
-            ?? "https://openrouter.ai/api";
+        _backends = backendOptions.Value;
     }
 
     internal static void ForwardClientIdentityHeaders(HttpRequest clientRequest, HttpRequestMessage upstreamRequest)
@@ -88,6 +88,7 @@ internal sealed class ProxyHandler
         string? originalModel = null;
         string? upstreamModel = null;
         string? role = null;
+        string? selectedBackend = null;
         string? proxyServer = null;
         byte[] bodyToSend = bodyBytes;
         var contentType = ctx.Request.ContentType ?? "application/json";
@@ -120,9 +121,9 @@ internal sealed class ProxyHandler
                     {
                         role = "classifier";
                         originalModel = GetModel(root) ?? "claude-sonnet-4-20250514";
-                        var mapResult = _mapper.Map(classifierSnapshot.TargetModel!);
-                        upstreamModel = mapResult.TargetModel;
-                        proxyServer = mapResult.ProxyServer;
+                        upstreamModel = classifierSnapshot.Target!;
+                        selectedBackend = classifierSnapshot.Backend;
+                        proxyServer = classifierSnapshot.ProxyServer;
                         newModel = upstreamModel;
                         LogClassifierDiagnostics(root, isClassifier);
                     }
@@ -131,6 +132,7 @@ internal sealed class ProxyHandler
                         originalModel = model;
                         var mapResult = _mapper.Map(model);
                         upstreamModel = mapResult.TargetModel;
+                        selectedBackend = mapResult.Backend;
                         proxyServer = mapResult.ProxyServer;
                         if (upstreamModel != model)
                             newModel = upstreamModel;
@@ -162,11 +164,12 @@ internal sealed class ProxyHandler
         var requestBody = _complianceWriter.IsEnabled ? Encoding.UTF8.GetString(bodyBytes) : string.Empty;
 
         // 4. Build and send upstream request
-        var fullUrl = _upstreamBaseUrl + path;
-        var httpClientName = !string.IsNullOrEmpty(proxyServer)
-            ? $"openrouter-proxy-{proxyServer}"
-            : "openrouter";
-        var client = _hcf.CreateClient(httpClientName);
+        var route = BackendRoute.Create(
+            new MapResult(upstreamModel ?? originalModel ?? "", selectedBackend ?? BackendOptions.DefaultBackendName, proxyServer),
+            _backends,
+            path);
+        var fullUrl = route.Url;
+        var client = _hcf.CreateClient(route.HttpClientName);
         using var upstreamReq = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), fullUrl)
         {
             Content = new ByteArrayContent(bodyToSend)

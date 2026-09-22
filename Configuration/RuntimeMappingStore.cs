@@ -8,6 +8,7 @@ internal sealed class RuntimeMappingStore
     private readonly IReadOnlyList<MappingRule> _baseRules;
     private readonly string _runtimeConfigPath;
     private readonly ProxyServerOptions _proxyServers;
+    private readonly BackendOptions _backends;
     private readonly ILogger<RuntimeMappingStore> _logger;
     private volatile IReadOnlyList<MappingRule> _rules;
 
@@ -21,12 +22,15 @@ internal sealed class RuntimeMappingStore
         IOptions<ModelMappingOptions> baseOptions,
         IOptions<AdminOptions> adminOptions,
         IOptions<ProxyServerOptions> proxyOptions,
+        IOptions<BackendOptions> backendOptions,
         ILogger<RuntimeMappingStore> logger)
     {
         _baseRules = baseOptions.Value.Rules;
         _runtimeConfigPath = adminOptions.Value.RuntimeConfigPath;
         _proxyServers = proxyOptions.Value;
+        _backends = backendOptions.Value;
         _logger = logger;
+        BackendConfiguration.ValidateRules(_baseRules, _backends);
         _rules = LoadMerged();
     }
 
@@ -36,6 +40,7 @@ internal sealed class RuntimeMappingStore
     public void Save(List<MappingRule> runtimeRules)
     {
         ValidateProxyServers(runtimeRules);
+        BackendConfiguration.ValidateRules(runtimeRules, _backends);
         WriteRuntimeFile(runtimeRules);
         _rules = Merge(runtimeRules);
         _logger.LogInformation("Runtime mappings saved: {Count} rules written to {Path}",
@@ -48,6 +53,7 @@ internal sealed class RuntimeMappingStore
     public void Upsert(MappingRule rule)
     {
         ValidateProxyServers(new[] { rule });
+        BackendConfiguration.ValidateRules(new[] { rule }, _backends);
         var runtimeRules = LoadRuntimeRules();
 
         var idx = runtimeRules.FindIndex(r =>
@@ -80,7 +86,10 @@ internal sealed class RuntimeMappingStore
 
     private List<MappingRule> LoadMerged()
     {
-        return Merge(LoadRuntimeRules());
+        var runtimeRules = LoadRuntimeRules();
+        ValidateProxyServers(runtimeRules);
+        BackendConfiguration.ValidateRules(runtimeRules, _backends);
+        return Merge(runtimeRules);
     }
 
     private List<MappingRule> Merge(List<MappingRule> runtimeRules)
