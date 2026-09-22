@@ -8,8 +8,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Run locally (listens on http://0.0.0.0:4000)
 dotnet run
 
-# Override upstream via env var
+# Override the legacy/default backend via an environment variable
 Upstream__BaseUrl=https://openrouter.ai/api dotnet run
+
+# Run the full test project
+dotnet test Tests/AiGateway.Tests.csproj
+
+# Run one test class or test method
+dotnet test Tests/AiGateway.Tests.csproj --filter FullyQualifiedName~HealthEndpointsTests
+dotnet test Tests/AiGateway.Tests.csproj --filter FullyQualifiedName~HealthEndpointsTests.CheckBackends_ReturnsHealthyForEveryBackend
 
 # Build & publish (Release)
 dotnet publish -c Release -o out
@@ -34,7 +41,7 @@ curl -N http://localhost:4000/v1/messages \
   -d '{"model":"claude-haiku-4-20250514","max_tokens":50,"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-There are no tests yet.
+Tests live in `Tests/AiGateway.Tests.csproj` and use xUnit. The main project excludes `Tests/**/*.cs`, so run the test project explicitly.
 
 ## Architecture
 
@@ -51,7 +58,8 @@ This is a lightweight reverse proxy that spoofs Anthropic model discovery and re
    - Re-serializes the body only when it actually changed (model rewrite / classifier strip), streaming it through `Utf8JsonWriter` and copying untouched fields verbatim via `JsonElement.WriteTo`. Unchanged bodies are forwarded byte-for-byte.
    - **Non-streaming** (default or `stream: false`): reads full upstream response as bytes, rewrites model name back in the JSON body, sends as single response
    - **Streaming** (`stream: true`): passes `stream: true` through to upstream, streams SSE response line-by-line, rewrites model name in `data:` lines, flushes after each blank-line SSE event boundary
-   - Forwards to the configured upstream (`Upstream:BaseUrl`) with `Authorization: Bearer` and `anthropic-version` headers
+   - Selects a named backend from the matched route (`Backends` plus optional legacy `Upstream:BaseUrl` fallback), then forwards with `Authorization: Bearer` and `anthropic-version` headers
+   - Uses `backend-{name}` clients for direct routes and `backend-{name}-proxy-{proxy}` clients for SOCKS5 routes
    - Writes a compliance log entry (only if enabled) via a non-blocking `Channel<T>.TryWrite`
    - Log messages include a `[classifier]` role tag for classifier-routed requests
 
@@ -75,9 +83,11 @@ Claude Code auto-mode sends lightweight security-classifier requests before exec
 
 Both must be present in the `system` array. When detected, the request is routed to `Classifier:Target` (with its optional `Backend` and `ProxyServer`) instead of the main model mapping. The Anthropic-internal `x-anthropic-billing-header` block is stripped before forwarding. Remove or empty `Classifier:Target` to disable.
 
-### Model mapping (`Proxy/ModelMapper.cs`)
+### Backend configuration and model mapping (`Configuration/BackendConfiguration.cs`, `Proxy/ModelMapper.cs`)
 
-Prefix-based, first-match-wins. Rules are evaluated in order. The `claude-haiku` rule must appear before the `claude` catch-all. No regex — just `string.StartsWith`.
+`Backends` is a case-insensitive dictionary of named Anthropic-compatible base URLs. Rules are prefix-based and first-match-wins; a rule may select `Backend` and `ProxyServer` independently. Rules without `Backend` use `openrouter`. The `claude-haiku` rule must appear before the `claude` catch-all. No regex — just `string.StartsWith`.
+
+Startup normalizes legacy `Upstream:BaseUrl` into the `openrouter` backend when needed and rejects rules that reference an undefined backend or SOCKS proxy. `ModelMapper.Map()` returns the rewritten model plus effective backend and proxy; `ProxyHandler` uses that result to choose the named HTTP client.
 
 Rules come from `RuntimeMappingStore` (a singleton), which merges three sources at startup — highest priority wins:
 
@@ -134,6 +144,10 @@ Key behaviors:
 - Invalid `ProxyServer` reference → 400 with the name of the undefined proxy server.
 - `mappings-runtime.json` is git-ignored and never written back to `appsettings.json`. To "promote" a runtime change to a default, edit `appsettings.json` manually.
 - Docker: set `Admin__RuntimeConfigPath` to a writable volume mount (the chiseled `/app` dir is not guaranteed writable).
+
+### Health checkpoint (`Health/HealthEndpoints.cs`)
+
+`GET /health` checks every configured backend concurrently with a separate 5-second timeout per backend, using the same `backend-{name}` clients as proxy traffic. Any HTTP response is considered reachable regardless of status code; only timeouts and connection failures are unhealthy. It returns per-backend status, URL, latency, and error; overall status is `503` if any backend is unreachable and `200` only when all are reachable. This is a network reachability check, not validation of API compatibility, credentials, model access, or inference availability. Unit tests are in `Tests/HealthEndpointsTests.cs`.
 
 ### CORS
 

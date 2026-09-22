@@ -193,10 +193,26 @@ curl -X DELETE http://localhost:4000/admin/mappings/claude \
 ## Health check
 
 ```
-GET /health → {"status":"healthy","upstream":"https://openrouter.ai/api","latency_ms":42}
+GET /health → {
+  "status": "healthy",
+  "backends": {
+    "openrouter": {
+      "status": "healthy",
+      "upstream": "https://openrouter.ai/api",
+      "latency_ms": 42,
+      "error": null
+    },
+    "lmstudio": {
+      "status": "healthy",
+      "upstream": "http://127.0.0.1:1234",
+      "latency_ms": 3,
+      "error": null
+    }
+  }
+}
 ```
 
-Tests connectivity to the configured upstream with a 5-second timeout. Returns `503` when the upstream is unreachable.
+Checks every configured backend concurrently with a 5-second timeout per backend. Any HTTP response indicates that the backend is reachable, regardless of its status code; only connection failures and timeouts are marked unhealthy. Returns `503` if any backend is unreachable, while still including the result for every backend. This checks network reachability only, not API compatibility, credentials, model access, or inference availability.
 
 ## Project structure
 
