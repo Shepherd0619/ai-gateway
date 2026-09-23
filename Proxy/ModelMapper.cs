@@ -15,6 +15,7 @@ internal sealed class ModelMapper
         var current = model;
         var backend = BackendOptions.DefaultBackendName;
         var backendSelected = false;
+        var proxySelected = false;
         string? proxyServer = null;
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -31,7 +32,12 @@ internal sealed class ModelMapper
                 backendSelected = true;
             }
 
-            proxyServer ??= string.IsNullOrEmpty(rule.ProxyServer) ? null : rule.ProxyServer;
+            if (!proxySelected && rule.ProxyServer is not null)
+            {
+                proxyServer = string.IsNullOrEmpty(rule.ProxyServer) ? null : rule.ProxyServer;
+                proxySelected = true;
+            }
+
             if (string.IsNullOrEmpty(rule.Target))
                 break;
 

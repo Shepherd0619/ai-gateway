@@ -148,6 +148,23 @@ public sealed class ModelMapperTests
     }
 
     [Fact]
+    public void Map_ExplicitEmptyProxyClearsProxyInheritedFromRemappedModel()
+    {
+        var rules = new[]
+        {
+            new MappingRule { Prefix = "claude-chat", Target = "google/gemma-4-e4b", Backend = "lmstudio", ProxyServer = "" },
+            new MappingRule { Prefix = "google/", ProxyServer = "us-exit" },
+        };
+        var mapper = CreateMapper(rules);
+
+        var result = mapper.Map("claude-chat");
+
+        Assert.Equal("google/gemma-4-e4b", result.TargetModel);
+        Assert.Equal("lmstudio", result.Backend);
+        Assert.Null(result.ProxyServer);
+    }
+
+    [Fact]
     public void Map_StopsAtEmptyTargetAfterApplyingProxy()
     {
         var rules = new[]
