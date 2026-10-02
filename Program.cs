@@ -1,7 +1,6 @@
 using AiGateway.Admin;
 using AiGateway.Compliance;
 using AiGateway.Configuration;
-using AiGateway.Discovery;
 using AiGateway.Health;
 using AiGateway.Proxy;
 
@@ -103,7 +102,6 @@ startupLogger.LogInformation("Startup: upstream={Url}, origins=[{Origins}], rule
 
 // ── Endpoints ──
 app.MapHealthEndpoints();
-app.MapModelDiscoveryEndpoints();
 app.MapAdminEndpoints();
 app.Map("/v1/{**catchAll}", app.Services.GetRequiredService<ProxyHandler>().Invoke);
 
