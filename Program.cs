@@ -1,6 +1,7 @@
 using AiGateway.Admin;
 using AiGateway.Compliance;
 using AiGateway.Configuration;
+using AiGateway.Discovery;
 using AiGateway.Health;
 using AiGateway.Proxy;
 
@@ -12,6 +13,7 @@ builder.Services.Configure<ClassifierOptions>(builder.Configuration.GetSection("
 builder.Services.Configure<ComplianceLogOptions>(builder.Configuration.GetSection("ComplianceLog"));
 builder.Services.Configure<CorsOptions>(builder.Configuration.GetSection("Cors"));
 builder.Services.Configure<AdminOptions>(builder.Configuration.GetSection("Admin"));
+builder.Services.Configure<ModelDiscoveryOptions>(builder.Configuration.GetSection("ModelDiscovery"));
 
 // ── CORS ──
 var corsOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
@@ -80,6 +82,7 @@ var upstreamBaseUrl = backends[BackendOptions.DefaultBackendName].BaseUrl;
 // ── Application services ──
 builder.Services.AddSingleton<RuntimeMappingStore>();
 builder.Services.AddSingleton<RuntimeClassifierStore>();
+builder.Services.AddSingleton<RuntimeModelDiscoveryStore>();
 builder.Services.AddSingleton<ModelMapper>();
 builder.Services.AddSingleton<ComplianceLogWriter>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ComplianceLogWriter>());
@@ -103,6 +106,7 @@ startupLogger.LogInformation("Startup: upstream={Url}, origins=[{Origins}], rule
 // ── Endpoints ──
 app.MapHealthEndpoints();
 app.MapAdminEndpoints();
+app.MapModelDiscoveryEndpoints();
 app.Map("/v1/{**catchAll}", app.Services.GetRequiredService<ProxyHandler>().Invoke);
 
 app.Run();

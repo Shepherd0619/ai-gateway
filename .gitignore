@@ -6,3 +6,4 @@ obj/
 *.suo
 mappings-runtime.json
 classifier-runtime.json
+model-discovery-runtime.json

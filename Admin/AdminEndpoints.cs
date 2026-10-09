@@ -129,6 +129,33 @@ internal static class AdminEndpoints
             return Results.NoContent();
         });
 
+        // GET /admin/model-discovery — get the effective model catalog.
+        group.MapGet("/model-discovery", (RuntimeModelDiscoveryStore discovery) =>
+            Results.Json(BuildModelDiscoveryView(discovery.Snapshot)));
+
+        // PUT /admin/model-discovery — replace runtime discovery settings.
+        group.MapPut("/model-discovery", (RuntimeModelDiscoveryStore discovery, ModelDiscoveryOptions? request) =>
+        {
+            if (request is null)
+                return Results.Json(new { error = "Request body is required" }, statusCode: 400);
+
+            try
+            {
+                return Results.Json(BuildModelDiscoveryView(discovery.Save(request)));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+
+        // DELETE /admin/model-discovery — restore appsettings/environment configuration.
+        group.MapDelete("/model-discovery", (RuntimeModelDiscoveryStore discovery) =>
+        {
+            discovery.Delete();
+            return Results.NoContent();
+        });
+
         // GET /admin/proxy-health — probe every configured ProxyServer for reachability
         group.MapGet("/proxy-health", async (
             IHttpClientFactory hcf,
@@ -179,5 +206,10 @@ internal static class AdminEndpoints
         source = snapshot.Source,
     };
 
+    private static object BuildModelDiscoveryView(ModelDiscoverySnapshot snapshot) => new
+    {
+        enabled = snapshot.Enabled,
+        models = snapshot.Models,
+    };
 
 }

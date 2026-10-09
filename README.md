@@ -3,7 +3,7 @@
 [![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-BSD%203--Clause-blue.svg)](LICENSE)
 
-A lightweight reverse proxy that lets you use non-Anthropic models with tools hard-coded to the Anthropic Messages API. It presents a Claude-compatible model list, rewrites model names in-flight, and forwards requests to OpenRouter's Anthropic-compatible API.
+A lightweight reverse proxy that lets you use non-Anthropic models with tools hard-coded to the Anthropic Messages API. It can optionally serve an administrator-configured model list in OpenAI-compatible or Anthropic format, rewrites model names in-flight, and forwards requests to OpenRouter's Anthropic-compatible API.
 
 **Why?** Some AI tools (e.g. Claude Code) filter available models to Anthropic's own list and won't let you pick anything else — even when the upstream provider speaks the same API format. This proxy sidesteps that limitation without touching the tool itself.
 
@@ -26,7 +26,7 @@ flowchart LR
     B -- "model name rewritten back" --> A
 ```
 
-1. **Model discovery** — `GET /v1/models` returns a Claude-flavored model list so the client tool sees models it trusts.
+1. **Optional model discovery** — `GET /v1/models` serves a configured shared catalog when `ModelDiscovery:Enabled` is true (OpenAI-compatible format by default; Anthropic format when `anthropic-version` is present). When disabled (the default), the request is forwarded to the configured upstream unchanged.
 2. **Classifier detection** — Auto-mode security classifier requests are identified by their system-prompt signature and routed directly to the configured classifier route (`Classifier:Target` plus optional `Backend` and `ProxyServer`), bypassing ordinary model mapping entirely.
 3. **Model rewriting** — `claude-sonnet-4-20250514` in the request body becomes `deepseek/deepseek-v4-pro` before it hits OpenRouter. The response model name is rewritten back so the client never notices.
 4. **API key passthrough (BYOK)** — Both `x-api-key` (desktop) and `Authorization: Bearer` (CLI) headers are accepted. The key is forwarded as `Authorization: Bearer` upstream. You use your own OpenRouter key — no shared keys, no proxy-side auth.
@@ -78,6 +78,9 @@ Pre-built images are published to [GitHub Container Registry](https://github.com
 ### Verify
 
 ```bash
+# Model discovery is disabled by default and GET /v1/models is passed through upstream.
+# To serve the configured local catalog, first set ModelDiscovery:Enabled=true or use the admin API.
+
 # 1. Model discovery
 curl http://localhost:4000/v1/models -H "x-api-key: sk-or-v1-YOUR_KEY"
 
@@ -95,18 +98,20 @@ export ANTHROPIC_AUTH_TOKEN=sk-or-v1-YOUR_KEY
 
 ## Configuration
 
-All settings live in `appsettings.json`.
+All settings live in `appsettings.json`. `ModelDiscovery` is disabled by default and can expose the same catalog in two formats: OpenAI-compatible unless the inbound request has `anthropic-version`, in which case Anthropic model-list JSON is returned. A listed model does not implicitly create a model mapping; configure `ModelMapping` separately for routing.
 
 | Section | Key | Default | Description |
 |---|---|---|---|
 | `ModelMapping` | `Rules` | — | Array of `{ "Prefix", "Target", "Backend", "ProxyServer" }` objects for model routing and rewriting |
+| `ModelDiscovery` | `Enabled` | `false` | Serve the configured model catalog locally at `GET /v1/models`; disabled requests continue to the upstream |
+| `ModelDiscovery` | `Models` | `[]` | Shared catalog entries with required `Id` and optional `DisplayName`, `CreatedAt` (ISO 8601), and `OwnedBy` |
 | `Backends` | `<name>.BaseUrl` | `openrouter` / `https://openrouter.ai/api` | Named Anthropic-compatible upstream backends |
 | `Upstream` | `BaseUrl` | `https://openrouter.ai/api` | Legacy fallback used when `Backends.openrouter` is not configured |
 | `Classifier` | `Target`, `Backend`, `ProxyServer` | — | Dedicated route for auto-mode classifier requests; empty `Target` disables it |
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
 | `ComplianceLog` | `Path` | `/var/log/ai-gateway/compliance.log` | Where to write the compliance log |
 | `Admin` | `ApiKey` | — | API key protecting the admin API (unset disables it) |
-| `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted; classifier overrides are stored beside it as `classifier-runtime.json` |
+| `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted; classifier and model discovery overrides are stored beside it as `classifier-runtime.json` and `model-discovery-runtime.json` |
 
 The admin UI harden/export action includes both `ModelMapping` and the standalone `Classifier` route. Classifier routing is not evaluated through `ModelMapping` at runtime.
 
@@ -172,10 +177,28 @@ All admin endpoints require the `x-admin-key` header:
 | `PUT` | `/admin/mappings` | Replace all runtime rules |
 | `PATCH` | `/admin/mappings/{prefix}` | Upsert a single rule |
 | `DELETE` | `/admin/mappings/{prefix}` | Remove a runtime override (fall back to default) |
+| `GET` | `/admin/model-discovery` | Get enabled state and effective merged model catalog |
+| `PUT` | `/admin/model-discovery` | Replace runtime discovery settings (`enabled` and `models`) |
+| `DELETE` | `/admin/model-discovery` | Remove runtime settings and restore `ModelDiscovery` base configuration |
 
 ```bash
 # List rules
 curl http://localhost:4000/admin/mappings -H "x-admin-key: sk-admin-your-secret"
+
+# Enable model discovery with one shared catalog
+curl -X PUT http://localhost:4000/admin/model-discovery \
+  -H "x-admin-key: sk-admin-your-secret" \
+  -H "content-type: application/json" \
+  -d '{"enabled":true,"models":[{"id":"openai/gpt-4o","displayName":"GPT-4o","ownedBy":"openai"},{"id":"claude-sonnet-4-20250514","displayName":"Claude Sonnet 4","createdAt":"2025-05-14T00:00:00Z","ownedBy":"anthropic"}]}'
+
+# Anthropic clients identify their response format with anthropic-version
+curl http://localhost:4000/v1/models -H "anthropic-version: 2023-06-01" -H "x-api-key: sk-or-v1-YOUR_KEY"
+
+# OpenAI-compatible clients omit anthropic-version; GET /v1/models defaults to OpenAI format
+curl http://localhost:4000/v1/models -H "x-api-key: sk-or-v1-YOUR_KEY"
+
+# Remove runtime override and restore appsettings.json/environment configuration
+curl -X DELETE http://localhost:4000/admin/model-discovery -H "x-admin-key: sk-admin-your-secret"
 
 # Change the `claude` catch-all to a different model
 curl -X PATCH http://localhost:4000/admin/mappings/claude \
@@ -230,9 +253,11 @@ ai-gateway/
 │   ├── ModelMappingOptions.cs      # Record: list of MappingRules
 │   ├── AdminOptions.cs             # Record: admin API key + runtime config path
 │   ├── RuntimeMappingStore.cs      # Merged base + runtime rules, file persistence
+│   ├── ModelDiscoveryOptions.cs    # Optional discovery configuration and catalog entries
+│   ├── RuntimeModelDiscoveryStore.cs # Base + runtime model catalog merge and persistence
 │   └── ComplianceLogOptions.cs     # Record: log toggles
 ├── Discovery/
-│   └── ModelDiscoveryEndpoints.cs  # GET /v1/models — spoofed Claude model list
+│   └── ModelDiscoveryEndpoints.cs  # Optional OpenAI/Anthropic GET /v1/models responses
 ├── Health/
 │   └── HealthEndpoints.cs          # GET /health — upstream connectivity check
 ├── Compliance/

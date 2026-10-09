@@ -45,11 +45,11 @@ Tests live in `Tests/AiGateway.Tests.csproj` and use xUnit. The main project exc
 
 ## Architecture
 
-This is a lightweight reverse proxy that spoofs Anthropic model discovery and rewrites model names so tools locked to the Anthropic API can use non-Anthropic models via OpenRouter. It is a .NET 9 Minimal API with **zero third-party dependencies**.
+This is a lightweight reverse proxy that can optionally serve a configurable model catalog in OpenAI-compatible or Anthropic format, and rewrites model names so tools locked to the Anthropic API can use non-Anthropic models via OpenRouter. It is a .NET 9 Minimal API with **zero third-party dependencies**.
 
 ### Request flow
 
-1. **Model discovery** — `GET /v1/models` (`Discovery/ModelDiscoveryEndpoints.cs`) returns a hardcoded Claude-flavored model list so the client tool trusts the available models.
+1. **Model discovery** — `GET /v1/models` (`Discovery/ModelDiscoveryEndpoints.cs`) serves the configured shared catalog when `ModelDiscovery:Enabled` is true (OpenAI-compatible format by default, Anthropic format when `anthropic-version` is present). It is disabled by default; disabled requests are delegated to the existing proxy and forwarded upstream.
 2. **Proxy** — `POST /v1/{**catchAll}` (`Proxy/ProxyHandler.cs`) does the core work:
    - Extracts API key from `x-api-key` (desktop) or `Authorization: Bearer` (CLI) → returns 401 if missing
    - Reads the request body as raw UTF-8 bytes and parses it once with `JsonDocument` (zero-copy over the bytes); detects the client's `"stream": true/false` preference from the top-level `stream` field
@@ -136,13 +136,14 @@ Endpoints:
 - `PUT /admin/mappings` — replace all runtime rules
 - `PATCH /admin/mappings/{prefix}` — upsert a single rule (prefix from URL takes precedence over body)
 - `DELETE /admin/mappings/{prefix}` — remove a runtime override (falls back to base rule)
+- `GET /admin/model-discovery` / `PUT /admin/model-discovery` / `DELETE /admin/model-discovery` — read, replace, or reset shared model discovery settings and catalog
 
 Key behaviors:
 
 - `RuntimeMappingStore.Save/Upsert/Delete` write to `mappings-runtime.json` (path from `Admin:RuntimeConfigPath`, default `mappings-runtime.json`), then atomically swap the in-memory merged view (`volatile IReadOnlyList<MappingRule>`). Proxy reads are lock-free.
 - No API key configured (`Admin:ApiKey` null/empty) → admin API disabled, `/admin/*` returns 404 (endpoint existence not leaked).
 - Invalid `ProxyServer` reference → 400 with the name of the undefined proxy server.
-- `mappings-runtime.json` is git-ignored and never written back to `appsettings.json`. To "promote" a runtime change to a default, edit `appsettings.json` manually.
+- Runtime overrides are git-ignored and never written back to `appsettings.json`. Mapping overrides use `mappings-runtime.json`; classifier and model discovery overrides are stored beside it as `classifier-runtime.json` and `model-discovery-runtime.json`. To "promote" a runtime change to a default, edit `appsettings.json` manually.
 - Docker: set `Admin__RuntimeConfigPath` to a writable volume mount (the chiseled `/app` dir is not guaranteed writable).
 
 ### Health checkpoint (`Health/HealthEndpoints.cs`)
@@ -164,7 +165,7 @@ A browser CORS policy is configured via `appsettings.json` → `Cors:AllowedOrig
 
 Uses `IOptions<T>` with records (not classes with setters). All settings overridable via env vars with the `__` separator (e.g. `Upstream__BaseUrl`).
 
-The exception is model mapping rules, which are mutable at runtime via `RuntimeMappingStore` (a singleton holding a `volatile` merged view, not a static `IOptions` snapshot).
+Model mapping rules and model discovery settings are mutable at runtime via `RuntimeMappingStore` and `RuntimeModelDiscoveryStore` (singletons holding volatile snapshots, not static `IOptions` snapshots). Discovery is disabled by default via `ModelDiscovery:Enabled`; its shared catalog uses required `Id` and optional `DisplayName`, `CreatedAt` (ISO 8601), and `OwnedBy`. Runtime overrides merge first by case-insensitive model ID and persist to `model-discovery-runtime.json` beside `Admin:RuntimeConfigPath`.
 
 ### Compliance logging (`Compliance/`)
 
