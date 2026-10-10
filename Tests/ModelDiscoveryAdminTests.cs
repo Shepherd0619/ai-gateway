@@ -23,7 +23,6 @@ public sealed class ModelDiscoveryAdminTests
                 Models = [new ModelDiscoveryModel { Id = "gpt-test", DisplayName = "GPT Test" }],
             });
             var context = new DefaultHttpContext();
-            context.Request.Headers["x-api-key"] = "client-key";
             context.Response.Body = new MemoryStream();
             await ModelDiscoveryEndpoints.HandleModels(context, store, CreateProxyHandler());
             context.Response.Body.Position = 0;
@@ -32,7 +31,6 @@ public sealed class ModelDiscoveryAdminTests
             Assert.Contains("\"owned_by\":\"ai-gateway\"", openAi);
 
             context = new DefaultHttpContext();
-            context.Request.Headers["x-api-key"] = "client-key";
             context.Request.Headers["anthropic-version"] = "2023-06-01";
             context.Response.Body = new MemoryStream();
             await ModelDiscoveryEndpoints.HandleModels(context, store, CreateProxyHandler());
@@ -60,12 +58,6 @@ public sealed class ModelDiscoveryAdminTests
             store.Save(new ModelDiscoveryOptions { Enabled = true, Models = [new ModelDiscoveryModel { Id = "private" }] });
             context = new DefaultHttpContext();
             context.Request.Path = "/v1/models";
-            await ModelDiscoveryEndpoints.HandleModels(context, store, proxy);
-            Assert.Equal(StatusCodes.Status401Unauthorized, context.Response.StatusCode);
-
-            context = new DefaultHttpContext();
-            context.Request.Path = "/v1/models";
-            context.Request.Headers["Authorization"] = "Bearer key";
             context.Response.Body = new MemoryStream();
             await ModelDiscoveryEndpoints.HandleModels(context, store, proxy);
             Assert.Equal(StatusCodes.Status200OK, context.Response.StatusCode);

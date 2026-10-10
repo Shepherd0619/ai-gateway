@@ -14,7 +14,7 @@ internal static class ModelDiscoveryEndpoints
     internal static async Task HandleModels(HttpContext ctx, RuntimeModelDiscoveryStore store, ProxyHandler proxy)
     {
         var snapshot = store.Snapshot;
-        if (!snapshot.Enabled || !HasClientApiKey(ctx.Request))
+        if (!snapshot.Enabled)
         {
             await proxy.Invoke(ctx);
             return;
@@ -29,16 +29,6 @@ internal static class ModelDiscoveryEndpoints
         await ctx.Response.WriteAsJsonAsync(ToOpenAiResponse(snapshot.Models), ctx.RequestAborted);
     }
 
-    private static bool HasClientApiKey(HttpRequest request)
-    {
-        if (!string.IsNullOrEmpty(request.Headers["x-api-key"].FirstOrDefault()))
-            return true;
-
-        var authorization = request.Headers.Authorization.FirstOrDefault();
-        return authorization is not null &&
-               authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) &&
-               !string.IsNullOrWhiteSpace(authorization["Bearer ".Length..]);
-    }
 
     internal static object ToOpenAiResponse(IReadOnlyList<ModelDiscoveryModel> models) => new OpenAiModelList(
         "list",
