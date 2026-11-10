@@ -114,7 +114,14 @@ public sealed class RuntimeBackendTranslationStoreTests
     {
         var directory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
         var configuredPath = Path.Combine(directory, configuredFileName);
-        var translationPath = Path.Combine(directory, "backend-translations-runtime-overrides.json");
+        var pathComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        var useFallbackPath = string.Equals(configuredFileName, "backend-translations-runtime.json", pathComparison);
+        var translationFileName = useFallbackPath
+            ? "backend-translations-runtime-overrides.json"
+            : "backend-translations-runtime.json";
+        var translationPath = Path.Combine(directory, translationFileName);
         const string sentinel = "mapping-runtime-sentinel";
         try
         {

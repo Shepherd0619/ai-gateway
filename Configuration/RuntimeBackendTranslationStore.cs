@@ -19,6 +19,9 @@ internal sealed record BackendTranslationView(
 internal sealed class RuntimeBackendTranslationStore
 {
     private const string RuntimeFileName = "backend-translations-runtime.json";
+    private static readonly StringComparison RuntimePathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
 
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
@@ -112,12 +115,12 @@ internal sealed class RuntimeBackendTranslationStore
         var absoluteConfiguredPath = Path.GetFullPath(configuredRuntimePath);
         var directory = Path.GetDirectoryName(absoluteConfiguredPath) ?? ".";
         var runtimePath = Path.Combine(directory, RuntimeFileName);
-        if (!string.Equals(runtimePath, absoluteConfiguredPath, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(runtimePath, absoluteConfiguredPath, RuntimePathComparison))
             return runtimePath;
 
         var fallbackStem = Path.Combine(directory, "backend-translations-runtime-overrides");
         var fallbackPath = fallbackStem + ".json";
-        for (var suffix = 1; string.Equals(fallbackPath, absoluteConfiguredPath, StringComparison.OrdinalIgnoreCase); suffix++)
+        for (var suffix = 1; string.Equals(fallbackPath, absoluteConfiguredPath, RuntimePathComparison); suffix++)
             fallbackPath = $"{fallbackStem}-{suffix}.json";
         return fallbackPath;
     }
