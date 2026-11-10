@@ -38,6 +38,81 @@ internal static class AdminEndpoints
         group.MapGet("/backends", (IOptions<BackendOptions> options) =>
             Results.Json(new { backends = options.Value.Keys }));
 
+        // GET /admin/backend-translations — list each backend's effective translation settings.
+        group.MapGet("/backend-translations", (RuntimeBackendTranslationStore store) =>
+            Results.Json(new { backends = store.All }));
+
+        // PUT /admin/backend-translations/{name} — persist a runtime translation override.
+        group.MapPut("/backend-translations/{name}", (
+            RuntimeBackendTranslationStore store,
+            string name,
+            BackendTranslationUpdate? update) =>
+        {
+            if (update is null)
+                return Results.Json(new { error = "Request body is required" }, statusCode: 400);
+
+            try
+            {
+                return Results.Json(store.Save(name, update));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+
+        // DELETE /admin/backend-translations/{name} — remove the named runtime override.
+        group.MapDelete("/backend-translations/{name}", (RuntimeBackendTranslationStore store, string name) =>
+        {
+            try
+            {
+                store.Delete(name);
+                return Results.NoContent();
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+
+        // Query-name fallback supports backend names that are not safe as route segments.
+        group.MapPut("/backend-translations", (
+            RuntimeBackendTranslationStore store,
+            HttpRequest request,
+            BackendTranslationUpdate? update) =>
+        {
+            var name = request.Query["name"].FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(name))
+                return Results.Json(new { error = "Backend name query parameter is required" }, statusCode: 400);
+            if (update is null)
+                return Results.Json(new { error = "Request body is required" }, statusCode: 400);
+
+            try
+            {
+                return Results.Json(store.Save(name, update));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+        group.MapDelete("/backend-translations", (RuntimeBackendTranslationStore store, HttpRequest request) =>
+        {
+            var name = request.Query["name"].FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(name))
+                return Results.Json(new { error = "Backend name query parameter is required" }, statusCode: 400);
+
+            try
+            {
+                store.Delete(name);
+                return Results.NoContent();
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+
         // GET /admin/mappings — list all effective rules (merged view)
         group.MapGet("/mappings", (RuntimeMappingStore store) =>
             Results.Json(store.Rules));

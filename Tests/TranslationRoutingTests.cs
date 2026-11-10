@@ -176,6 +176,33 @@ public sealed class TranslationRoutingTests
     }
 
     [Fact]
+    public async Task RuntimeTranslationSettings_ApplyToEachNewRequest()
+    {
+        using var f = new Fixture();
+
+        f.BackendTranslationStore.Save("openrouter",
+            new BackendTranslationUpdate(false, "ChatCompletions", "OpenAI"));
+        await f.Invoke(Request);
+
+        Assert.EndsWith("/v1/messages", f.Url);
+        using (var anthropicRequest = JsonDocument.Parse(f.Sent!))
+        {
+            Assert.True(anthropicRequest.RootElement.TryGetProperty("messages", out _));
+            Assert.Equal(5, anthropicRequest.RootElement.GetProperty("max_tokens").GetInt32());
+            Assert.False(anthropicRequest.RootElement.TryGetProperty("input", out _));
+        }
+
+        f.BackendTranslationStore.Save("openrouter",
+            new BackendTranslationUpdate(true, "Responses", "OpenAI"));
+        await f.Invoke(Request);
+
+        Assert.EndsWith("/v1/responses", f.Url);
+        using var responsesRequest = JsonDocument.Parse(f.Sent!);
+        Assert.True(responsesRequest.RootElement.TryGetProperty("input", out _));
+        Assert.False(responsesRequest.RootElement.TryGetProperty("messages", out _));
+    }
+
+    [Fact]
     public async Task Classifier_UsesFinalBackendFlagAndStripsBillingBlock()
     {
         using var f = new Fixture(classifier: true);
@@ -259,6 +286,8 @@ public sealed class TranslationRoutingTests
         private readonly HttpClient _client;
         private readonly ProxyHandler _handler;
         private readonly string _response;
+        private readonly string _runtimeDirectory;
+        public RuntimeBackendTranslationStore BackendTranslationStore { get; }
         private readonly int _status;
         public string? Url, Sent, Authorization, ClientName;
         public bool AnthropicVersion;
@@ -271,12 +300,14 @@ public sealed class TranslationRoutingTests
             values["openrouter:OpenAIProtocol"] = protocol;
             if (enabled is not null) values["openrouter:TranslateAnthropicToOpenAI"] = enabled.Value.ToString();
             var backends = Options.Create(new ConfigurationBuilder().AddInMemoryCollection(values).Build().Get<BackendOptions>()!);
-            var admin = Options.Create(new AdminOptions { RuntimeConfigPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString(), "mappings.json") });
+            _runtimeDirectory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+            var admin = Options.Create(new AdminOptions { RuntimeConfigPath = Path.Combine(_runtimeDirectory, "mappings.json") });
             var proxies = Options.Create(new ProxyServerOptions { ["test-proxy"] = new ProxyServerConfig { Address = "socks5://127.0.0.1:7890" } });
             var store = new RuntimeMappingStore(Options.Create(new ModelMappingOptions { Rules = [new MappingRule { Prefix = "claude", Target = "remote-model" }] }), admin, proxies, backends, NullLogger<RuntimeMappingStore>.Instance);
             var classifierStore = new RuntimeClassifierStore(Options.Create(new ClassifierOptions { Target = classifier ? "classifier-model" : "", Backend = "openrouter", ProxyServer = classifier ? "test-proxy" : null }), admin, backends, proxies, NullLogger<RuntimeClassifierStore>.Instance);
+            BackendTranslationStore = new RuntimeBackendTranslationStore(backends, admin, NullLogger<RuntimeBackendTranslationStore>.Instance);
             var compliance = new ComplianceLogWriter(NullLogger<ComplianceLogWriter>.Instance, Options.Create(new ComplianceLogOptions()));
-            _handler = new ProxyHandler(this, NullLogger<ProxyHandler>.Instance, new ModelMapper(store), compliance, classifierStore, backends);
+            _handler = new ProxyHandler(this, NullLogger<ProxyHandler>.Instance, new ModelMapper(store), compliance, classifierStore, backends, BackendTranslationStore);
         }
         public async Task<DefaultHttpContext> Invoke(string body, string path = "/v1/messages", string query = "")
         {
@@ -293,6 +324,15 @@ public sealed class TranslationRoutingTests
             Authorization = request.Headers.Authorization?.ToString(); AnthropicVersion = request.Headers.Contains("anthropic-version");
             return new HttpResponseMessage((HttpStatusCode)_status) { Content = new StringContent(_response, Encoding.UTF8, _response.StartsWith("data:") ? "text/event-stream" : "application/json") };
         }
-        protected override void Dispose(bool disposing) { if (disposing) _client.Dispose(); base.Dispose(disposing); }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _client.Dispose();
+                if (Directory.Exists(_runtimeDirectory))
+                    Directory.Delete(_runtimeDirectory, recursive: true);
+            }
+            base.Dispose(disposing);
+        }
     }
 }

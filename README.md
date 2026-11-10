@@ -166,7 +166,7 @@ All settings live in `appsettings.json`. `ModelDiscovery` is disabled by default
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
 | `ComplianceLog` | `Path` | `/var/log/ai-gateway/compliance.log` | Where to write the compliance log |
 | `Admin` | `ApiKey` | — | API key protecting the admin API (unset disables it) |
-| `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted; classifier and model discovery overrides are stored beside it as `classifier-runtime.json` and `model-discovery-runtime.json` |
+| `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted; classifier and model discovery overrides are stored beside it as `classifier-runtime.json` and `model-discovery-runtime.json`, and backend translations as `backend-translations-runtime.json` (or `backend-translations-runtime-overrides.json` if that basename would collide with this configured path) |
 
 The admin UI harden/export action includes both `ModelMapping` and the standalone `Classifier` route. Classifier routing is not evaluated through `ModelMapping` at runtime.
 
@@ -235,6 +235,23 @@ All admin endpoints require the `x-admin-key` header:
 | `GET` | `/admin/model-discovery` | Get enabled state and effective merged model catalog |
 | `PUT` | `/admin/model-discovery` | Replace runtime discovery settings (`enabled` and `models`) |
 | `DELETE` | `/admin/model-discovery` | Remove runtime settings and restore `ModelDiscovery` base configuration |
+| `GET` | `/admin/backend-translations` | List effective translation settings for configured backends |
+| `PUT` | `/admin/backend-translations/{name}` | Save all three translation fields as a runtime override for one configured backend |
+| `DELETE` | `/admin/backend-translations/{name}` | Remove that backend's runtime override and restore its base settings |
+| `PUT` | `/admin/backend-translations?name={name}` | Query-name fallback for names containing `/` or `%`, or exactly `.` or `..` |
+| `DELETE` | `/admin/backend-translations?name={name}` | Query-name fallback for names containing `/` or `%`, or exactly `.` or `..` |
+
+#### Runtime backend translation settings
+
+`GET /admin/backend-translations` returns `{ "backends": [...] }`. Each backend entry includes its configured `name`, the three effective translation fields below, and `source` (`base` or `runtime`). `source` is read-only. For `PUT /admin/backend-translations/{name}`, provide all three fields; partial updates are not accepted. The path form remains supported for ordinary names; for names containing `/` or `%`, and for names exactly `.` or `..`, use the query form and URL-encode the name (for example, `PUT /admin/backend-translations?name=custom%20backend%2Fblue`):
+
+| JSON field | Required value |
+|---|---|
+| `translateAnthropicToOpenAI` | Boolean (`true` or `false`) |
+| `openAIProtocol` | `ChatCompletions` or `Responses` |
+| `reasoningFormat` | `OpenAI` or `OpenRouter` |
+
+Every endpoint requires the `x-admin-key` header. A successful PUT persists the runtime override and applies it to subsequent proxy requests without a gateway restart. Runtime settings are stored in `backend-translations-runtime.json` in the same directory as the file configured by `Admin:RuntimeConfigPath`; if the configured mapping path itself has that basename, translations instead use the distinct sibling `backend-translations-runtime-overrides.json`. They are reloaded after a process restart. For container redeploys, persist that directory on a writable volume. `DELETE /admin/backend-translations/{name}` removes only that backend's runtime override, restoring the configured base `Backends` values; it does not modify the base configuration. These endpoints expose backend names and translation settings only—they do not return `BaseUrl` or credentials.
 
 ```bash
 # List rules

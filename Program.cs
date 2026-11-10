@@ -83,6 +83,7 @@ var upstreamBaseUrl = backends[BackendOptions.DefaultBackendName].BaseUrl;
 builder.Services.AddSingleton<RuntimeMappingStore>();
 builder.Services.AddSingleton<RuntimeClassifierStore>();
 builder.Services.AddSingleton<RuntimeModelDiscoveryStore>();
+builder.Services.AddSingleton<RuntimeBackendTranslationStore>();
 builder.Services.AddSingleton<ModelMapper>();
 builder.Services.AddSingleton<ComplianceLogWriter>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ComplianceLogWriter>());
