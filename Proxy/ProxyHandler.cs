@@ -43,7 +43,9 @@ internal sealed class ProxyHandler
             "X-OpenRouter-Title",
             "HTTP-Referer",
             "Referer",
-            "X-Client-Name"
+            "X-Client-Name",
+            "OpenAI-Organization",
+            "OpenAI-Project"
         ];
 
         foreach (var headerName in identityHeaders)
@@ -59,6 +61,7 @@ internal sealed class ProxyHandler
     internal async Task Invoke(HttpContext ctx)
     {
         var path = ctx.Request.Path.Value ?? "/";
+        var upstreamPath = path + ctx.Request.QueryString;
 
         // 1. Extract API key — supports both x-api-key (desktop) and Authorization: Bearer (CLI)
         var clientKey = ctx.Request.Headers["x-api-key"].FirstOrDefault();
@@ -159,6 +162,36 @@ internal sealed class ProxyHandler
             }
         }
 
+        var backendName = selectedBackend ?? BackendOptions.DefaultBackendName;
+        var translate = _backends[backendName].TranslateAnthropicToOpenAI
+            && HttpMethods.IsPost(ctx.Request.Method) && path == "/v1/messages";
+        var responses = translate && _backends[backendName].OpenAIProtocol == OpenAIProtocol.Responses;
+        string[] responseStops = [];
+        if (_backends[backendName].TranslateAnthropicToOpenAI
+            && path.StartsWith("/v1/messages/", StringComparison.Ordinal))
+        {
+            await WriteTranslationError(ctx, 501, "This Anthropic endpoint is not supported by the translation backend.");
+            return;
+        }
+        if (translate)
+        {
+            ctx.Response.Headers["request-id"] = ctx.TraceIdentifier;
+            try
+            {
+                bodyToSend = responses ? AnthropicResponsesTranslator.TranslateRequest(bodyToSend, out responseStops)
+                    : AnthropicTranslator.TranslateRequest(bodyToSend, _backends[backendName].ReasoningFormat);
+                upstreamPath = (responses ? "/v1/responses" : "/v1/chat/completions") + ctx.Request.QueryString;
+                contentType = "application/json";
+            }
+            catch (Exception ex) when (ex is JsonException or TranslationException or InvalidOperationException)
+            {
+                _logger.LogWarning("DIAG translation ERROR trace={TraceId} backend={Backend} role={Role} message={Message}",
+                    ctx.TraceIdentifier, backendName, role ?? "chat", ex is TranslationException ? ex.Message : "Invalid Anthropic Messages request.");
+                await WriteTranslationError(ctx, 400, ex is TranslationException ? ex.Message : "Invalid Anthropic Messages request.");
+                return;
+            }
+        }
+
         // Compliance log records the *original* client body.  Decode it only when
         // compliance logging is enabled (otherwise the bytes are never needed again).
         var requestBody = _complianceWriter.IsEnabled ? Encoding.UTF8.GetString(bodyBytes) : string.Empty;
@@ -167,7 +200,7 @@ internal sealed class ProxyHandler
         var route = BackendRoute.Create(
             new MapResult(upstreamModel ?? originalModel ?? "", selectedBackend ?? BackendOptions.DefaultBackendName, proxyServer),
             _backends,
-            path);
+            upstreamPath);
         var fullUrl = route.Url;
         var client = _hcf.CreateClient(route.HttpClientName);
         using var upstreamReq = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), fullUrl)
@@ -177,8 +210,11 @@ internal sealed class ProxyHandler
         upstreamReq.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
         upstreamReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {clientKey}");
 
-        var anthropicVersion = ctx.Request.Headers["anthropic-version"].FirstOrDefault() ?? "2023-06-01";
-        upstreamReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion);
+        if (!translate)
+        {
+            var anthropicVersion = ctx.Request.Headers["anthropic-version"].FirstOrDefault() ?? "2023-06-01";
+            upstreamReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion);
+        }
         ForwardClientIdentityHeaders(ctx.Request, upstreamReq);
 
         if (_logger.IsEnabled(LogLevel.Debug))
@@ -197,9 +233,19 @@ internal sealed class ProxyHandler
         }
         catch (TaskCanceledException) when (!ctx.RequestAborted.IsCancellationRequested)
         {
+            if (translate)
+            {
+                await WriteTranslationError(ctx, 504, "Upstream request timed out.");
+                return;
+            }
             ctx.Response.StatusCode = 504;
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync("""{"error":{"type":"timeout","message":"Upstream request timed out"}}""", ctx.RequestAborted);
+            return;
+        }
+        catch (HttpRequestException) when (translate)
+        {
+            await WriteTranslationError(ctx, 502, "Unable to connect to the upstream backend.");
             return;
         }
         sw.Stop();
@@ -213,13 +259,13 @@ internal sealed class ProxyHandler
         {
             if (clientWantsStream && upstreamResp.IsSuccessStatusCode)
             {
-                await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, role);
+                await StreamSseResponse(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, role, translate, responses, responseStops);
             }
             else
             {
                 try
                 {
-                    await HandleNonStreaming(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, role);
+                    await HandleNonStreaming(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, role, translate, responses, responseStops);
                 }
                 catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
                 {
@@ -229,6 +275,13 @@ internal sealed class ProxyHandler
                 }
             }
         }
+    }
+
+    private static async Task WriteTranslationError(HttpContext ctx, int status, string message)
+    {
+        ctx.Response.StatusCode = status;
+        ctx.Response.ContentType = "application/json";
+        await ctx.Response.Body.WriteAsync(AnthropicTranslator.Error(status, message), ctx.RequestAborted);
     }
 
     private static string? GetModel(JsonElement root) =>
@@ -329,12 +382,32 @@ internal sealed class ProxyHandler
         string requestBody,
         string path,
         Stopwatch sw,
-        string? role)
+        string? role, bool translate = false, bool responses = false, IReadOnlyList<string>? responseStops = null)
     {
         // Read upstream response as raw bytes (non-streaming or error).
         var respBytes = await upstreamResp.Content.ReadAsByteArrayAsync(ctx.RequestAborted);
         var respToSend = ErrorResponseNormalizer.Normalize(respBytes, !upstreamResp.IsSuccessStatusCode);
-        var needsRewrite = originalModel is not null && upstreamModel is not null && upstreamModel != originalModel;
+        var statusCode = (int)upstreamResp.StatusCode;
+        if (translate)
+        {
+            if (upstreamResp.IsSuccessStatusCode)
+            {
+                try { respToSend = responses ? AnthropicResponsesTranslator.TranslateResponse(respBytes, originalModel!, responseStops) : AnthropicTranslator.TranslateResponse(respBytes, originalModel!); }
+                catch (Exception ex) when (ex is JsonException or TranslationException or InvalidOperationException)
+                {
+                    statusCode = 502;
+                    respToSend = AnthropicTranslator.Error(statusCode, "Upstream returned an invalid translated response.");
+                }
+            }
+            else
+            {
+                var message = "Upstream request failed.";
+                try { using var errorDoc = JsonDocument.Parse(respToSend); message = AnthropicTranslator.ErrorMessage(errorDoc.RootElement, message); }
+                catch (JsonException) { }
+                respToSend = AnthropicTranslator.Error(statusCode, message);
+            }
+        }
+        var needsRewrite = !translate && originalModel is not null && upstreamModel is not null && upstreamModel != originalModel;
 
         // ── Diagnostic logging ──
         if (upstreamResp.IsSuccessStatusCode)
@@ -348,8 +421,8 @@ internal sealed class ProxyHandler
         }
         else
         {
-            _logger.LogInformation("DIAG upstream ERROR status={Status} body={Body}",
-                (int)upstreamResp.StatusCode, respBytes.Length > 1000 ? Encoding.UTF8.GetString(respBytes, 0, 1000) : Encoding.UTF8.GetString(respBytes));
+            _logger.LogInformation("DIAG upstream ERROR trace={TraceId} status={Status} body={Body}",
+                ctx.TraceIdentifier, (int)upstreamResp.StatusCode, respBytes.Length > 1000 ? Encoding.UTF8.GetString(respBytes, 0, 1000) : Encoding.UTF8.GetString(respBytes));
         }
 
         // Rewrite response model back (e.g. DeepSeek → original Claude name).
@@ -385,14 +458,14 @@ internal sealed class ProxyHandler
             ClientIp = ctx.Connection.RemoteIpAddress?.ToString() ?? "-",
             OriginalModel = originalModel,
             UpstreamModel = upstreamModel,
-            StatusCode = (int)upstreamResp.StatusCode,
+            StatusCode = statusCode,
             DurationMs = sw.ElapsedMilliseconds,
             RequestBody = requestBody,
             ResponseBody = _complianceWriter.IsEnabled ? Encoding.UTF8.GetString(respBytes) : string.Empty
         });
 
         // Return proxied response
-        ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
+        ctx.Response.StatusCode = statusCode;
 
         foreach (var h in upstreamResp.Headers)
             ctx.Response.Headers[h.Key] = h.Value.ToArray();
@@ -403,7 +476,7 @@ internal sealed class ProxyHandler
         ctx.Response.Headers.Remove("transfer-encoding");
         ctx.Response.Headers.Remove("content-length");
 
-        ctx.Response.ContentType = upstreamResp.Content.Headers.ContentType?.ToString() ?? "application/json";
+        ctx.Response.ContentType = translate ? "application/json" : upstreamResp.Content.Headers.ContentType?.ToString() ?? "application/json";
 
         _logger.LogDebug("DIAG response content-type={ContentType} bodyLen={BodyLen}",
             ctx.Response.ContentType, respToSend.Length);
@@ -412,7 +485,7 @@ internal sealed class ProxyHandler
 
         _logger.LogInformation("Proxy {Method} {Path} {Original}->{Upstream} {StatusCode} {DurationMs}ms{Role}",
             ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
-            (int)upstreamResp.StatusCode, sw.ElapsedMilliseconds,
+            statusCode, sw.ElapsedMilliseconds,
             role is not null ? $" [{role}]" : "");
     }
 
@@ -424,7 +497,7 @@ internal sealed class ProxyHandler
         string requestBody,
         string path,
         Stopwatch sw,
-        string? role)
+        string? role, bool translate = false, bool responses = false, IReadOnlyList<string>? responseStops = null)
     {
         ctx.Response.StatusCode = (int)upstreamResp.StatusCode;
         ctx.Response.ContentType = "text/event-stream";
@@ -437,7 +510,11 @@ internal sealed class ProxyHandler
 
         try
         {
-            while (!reader.EndOfStream)
+            if (responses)
+                await new AnthropicResponsesSseTranslator(ctx.Response, originalModel!, ctx.RequestAborted, responseStops).RunAsync(upstreamStream);
+            else if (translate)
+                await new AnthropicSseTranslator(ctx.Response, originalModel!, ctx.RequestAborted).RunAsync(upstreamStream);
+            else while (!reader.EndOfStream)
             {
                 var line = await reader.ReadLineAsync(ctx.RequestAborted);
 

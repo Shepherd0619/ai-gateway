@@ -6,6 +6,8 @@
     <StripSymbols>true</StripSymbols>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Keep test/publish artifacts and local worktrees out of recursive SDK globs. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);Tests/**;out/**;.claude/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
