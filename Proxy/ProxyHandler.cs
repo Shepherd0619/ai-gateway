@@ -15,6 +15,7 @@ internal sealed class ProxyHandler
     private readonly ComplianceLogWriter _complianceWriter;
     private readonly BackendOptions _backends;
     private readonly RuntimeClassifierStore _classifier;
+    private readonly RuntimeBackendTranslationStore? _translationStore;
 
     public ProxyHandler(
         IHttpClientFactory hcf,
@@ -22,7 +23,8 @@ internal sealed class ProxyHandler
         ModelMapper mapper,
         ComplianceLogWriter complianceWriter,
         RuntimeClassifierStore classifier,
-        IOptions<BackendOptions> backendOptions)
+        IOptions<BackendOptions> backendOptions,
+        RuntimeBackendTranslationStore? translationStore = null)
     {
         _hcf = hcf;
         _logger = logger;
@@ -30,6 +32,7 @@ internal sealed class ProxyHandler
         _complianceWriter = complianceWriter;
         _classifier = classifier;
         _backends = backendOptions.Value;
+        _translationStore = translationStore;
     }
 
     internal static void ForwardClientIdentityHeaders(HttpRequest clientRequest, HttpRequestMessage upstreamRequest)
@@ -163,11 +166,22 @@ internal sealed class ProxyHandler
         }
 
         var backendName = selectedBackend ?? BackendOptions.DefaultBackendName;
-        var translate = _backends[backendName].TranslateAnthropicToOpenAI
+        var configuredBackend = _backends[backendName];
+        var translation = _translationStore?.Get(backendName);
+        var translateEnabled = translation?.TranslateAnthropicToOpenAI
+            ?? configuredBackend.TranslateAnthropicToOpenAI;
+        var protocol = translation is null
+            ? configuredBackend.OpenAIProtocol
+            : Enum.Parse<OpenAIProtocol>(translation.OpenAIProtocol);
+        var reasoningFormat = translation is null
+            ? configuredBackend.ReasoningFormat
+            : Enum.Parse<ReasoningFormat>(translation.ReasoningFormat);
+
+        var translate = translateEnabled
             && HttpMethods.IsPost(ctx.Request.Method) && path == "/v1/messages";
-        var responses = translate && _backends[backendName].OpenAIProtocol == OpenAIProtocol.Responses;
+        var responses = translate && protocol == OpenAIProtocol.Responses;
         string[] responseStops = [];
-        if (_backends[backendName].TranslateAnthropicToOpenAI
+        if (translateEnabled
             && path.StartsWith("/v1/messages/", StringComparison.Ordinal))
         {
             await WriteTranslationError(ctx, 501, "This Anthropic endpoint is not supported by the translation backend.");
@@ -179,7 +193,7 @@ internal sealed class ProxyHandler
             try
             {
                 bodyToSend = responses ? AnthropicResponsesTranslator.TranslateRequest(bodyToSend, out responseStops)
-                    : AnthropicTranslator.TranslateRequest(bodyToSend, _backends[backendName].ReasoningFormat);
+                    : AnthropicTranslator.TranslateRequest(bodyToSend, reasoningFormat);
                 upstreamPath = (responses ? "/v1/responses" : "/v1/chat/completions") + ctx.Request.QueryString;
                 contentType = "application/json";
             }
