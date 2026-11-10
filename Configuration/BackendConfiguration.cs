@@ -20,6 +20,10 @@ internal static class BackendConfiguration
         {
             if (string.IsNullOrWhiteSpace(config.BaseUrl))
                 throw new InvalidOperationException($"Backend '{name}' has an empty BaseUrl.");
+            if (!Enum.IsDefined(config.ReasoningFormat))
+                throw new InvalidOperationException($"Backend '{name}' has an unsupported ReasoningFormat.");
+            if (!Enum.IsDefined(config.OpenAIProtocol))
+                throw new InvalidOperationException($"Backend '{name}' has an unsupported OpenAIProtocol.");
         }
 
         return normalized;

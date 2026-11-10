@@ -3,7 +3,7 @@
 [![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-BSD%203--Clause-blue.svg)](LICENSE)
 
-A lightweight reverse proxy that lets you use non-Anthropic models with tools hard-coded to the Anthropic Messages API. It can optionally serve an administrator-configured model list in OpenAI-compatible or Anthropic format, rewrites model names in-flight, and forwards requests to OpenRouter's Anthropic-compatible API.
+A lightweight reverse proxy that lets you use non-Anthropic models with tools hard-coded to the Anthropic Messages API. It can optionally serve an administrator-configured model list in OpenAI-compatible or Anthropic format, rewrites model names in-flight, and can translate Anthropic requests and responses to use OpenAI-compatible Chat Completions backends.
 
 **Why?** Some AI tools (e.g. Claude Code) filter available models to Anthropic's own list and won't let you pick anything else — even when the upstream provider speaks the same API format. This proxy sidesteps that limitation without touching the tool itself.
 
@@ -15,12 +15,12 @@ A lightweight reverse proxy that lets you use non-Anthropic models with tools ha
 flowchart LR
     A[AI Tool<br/>Claude Code, etc.]
     B[AI Gateway<br/>C# proxy]
-    C[OpenRouter<br/>Anthropic Skin]
+    C[OpenRouter<br/>Chat Completions]
     D[DeepSeek V4 Pro]
     E[DeepSeek V4 Flash]
 
     A -- "Anthropic Messages API<br/>x-api-key: sk-or-v1-..." --> B
-    B -- "Anthropic Messages API<br/>Bearer sk-or-v1-...<br/>model name rewritten" --> C
+    B -- "Chat Completions API<br/>Bearer sk-or-v1-...<br/>translated request" --> C
     C --> D
     C --> E
     B -- "model name rewritten back" --> A
@@ -31,7 +31,7 @@ flowchart LR
 3. **Model rewriting** — `claude-sonnet-4-20250514` in the request body becomes `deepseek/deepseek-v4-pro` before it hits OpenRouter. The response model name is rewritten back so the client never notices.
 4. **API key passthrough (BYOK)** — Both `x-api-key` (desktop) and `Authorization: Bearer` (CLI) headers are accepted. The key is forwarded as `Authorization: Bearer` upstream. You use your own OpenRouter key — no shared keys, no proxy-side auth.
 
-Because OpenRouter's `/api` base already speaks the Anthropic Messages format natively, no protocol translation is needed. Only the model name changes.
+For backends with `TranslateAnthropicToOpenAI: true`, the gateway translates Messages requests to Chat Completions or Responses and translates JSON/SSE responses back to Anthropic format. Other backends retain Anthropic passthrough with model rewriting. The committed OpenRouter backend enables translation.
 
 ## Model mapping
 
@@ -96,6 +96,58 @@ export ANTHROPIC_BASE_URL=http://localhost:4000
 export ANTHROPIC_AUTH_TOKEN=sk-or-v1-YOUR_KEY
 ```
 
+## Backend protocol translation
+
+Enable translation independently on each named backend:
+
+```json
+{
+  "Backends": {
+    "openrouter": {
+      "BaseUrl": "https://openrouter.ai/api",
+      "TranslateAnthropicToOpenAI": true,
+      "ReasoningFormat": "OpenRouter"
+    },
+    "openai": {
+      "BaseUrl": "https://api.openai.com",
+      "TranslateAnthropicToOpenAI": true,
+      "OpenAIProtocol": "Responses"
+    },
+    "native-anthropic": {
+      "BaseUrl": "https://example.com",
+      "TranslateAnthropicToOpenAI": false
+    }
+  }
+}
+```
+
+The flag defaults to `false` when omitted. The committed OpenRouter configuration sets it to `true`. Set `Backends__openrouter__TranslateAnthropicToOpenAI=false` to restore the existing Anthropic route; backend configuration changes require a restart. Model mappings and classifier routing still select the model/backend/SOCKS proxy first, then the selected backend's flag determines translation. Existing API keys and client identity headers are forwarded.
+
+`OpenAIProtocol` selects the upstream endpoint: `ChatCompletions` (default) uses `POST <BaseUrl>/v1/chat/completions`; `Responses` uses `POST <BaseUrl>/v1/responses`. Both preserve the query string. For official OpenAI models using reasoning with function tools, use `Responses`: some models reject this combination in Chat Completions. Configure `BaseUrl` without `/v1` (for example, `https://openrouter.ai/api` or `https://api.openai.com`). Returned messages restore the client's original model name without replacing model-like text inside generated content. Model discovery behavior is unchanged.
+
+Supported translation includes system prompts, text, base64/URL images, function tool schemas, tool choice, parallel tool calls, tool results (including image results, carried in a following user message), and token limits. Chat Completions also supports stop sequences and sampling settings (`temperature`, `top_p`). Responses emulates `stop_sequences` locally on answer text (including matches across SSE deltas), excludes the matched delimiter and later content, and returns Anthropic `stop_reason: "stop_sequence"` with the matched string. Thinking and function arguments are not searched. This supports classifier requests carrying stop sequences. Since Responses has no native stop parameter, the gateway still consumes the upstream response through completion for usage and error reporting; upstream generation, latency and billed tokens are not reduced by this local truncation. Sampling settings are omitted when explicit reasoning is enabled. Streaming remains incremental and emits Anthropic message/content-block events with final upstream usage. Prompt cache hits are separated from uncached input tokens. Upstream HTTP errors retain their status and use Anthropic error envelopes; malformed responses return 502, and broken streams emit an SSE error instead of a successful message stop.
+
+For `ChatCompletions`, thinking controls are translated according to the selected backend's `ReasoningFormat` (`OpenAI` by default; the committed OpenRouter backend uses `OpenRouter`). This setting also selects the output limit parameter: Anthropic `max_tokens` becomes `max_completion_tokens` for `OpenAI` and remains `max_tokens` for `OpenRouter`. It only affects translated Messages requests and requires a restart. It is independent of the backend name and URL:
+
+| Anthropic control | `OpenAI` | `OpenRouter` |
+|---|---|---|
+| `thinking: {"type":"enabled","budget_tokens":4096}` | `reasoning_effort: "medium"` (approximate) | `reasoning: {"enabled":true,"max_tokens":4096}` |
+| `thinking: {"type":"adaptive"}` | `reasoning_effort: "high"` | `reasoning: {"enabled":true,"effort":"high"}` |
+| `thinking: {"type":"disabled"}` | `reasoning_effort: "none"` | `reasoning: {"enabled":false}` |
+| `output_config.effort` | `reasoning_effort` | `reasoning.effort` with `enabled: true` |
+
+Supported explicit effort values are `low`, `medium`, `high`, `xhigh`, and `max`; they are forwarded unchanged. Explicit effort takes precedence over the numeric budget; `thinking.type: disabled` takes precedence over effort. With neither control present, no reasoning setting is sent. Enabled thinking requires a positive integer budget; malformed thinking/effort values return 400. For `OpenAI`, budgets up to 1,024 map to `low`, up to 8,192 to `medium`, and larger budgets to `high`. These thresholds and adaptive's `high` default are gateway policy, not exact equivalents of Anthropic's token allocation or adaptive behavior. OpenRouter receives either a budget or an effort, never both. See the [OpenRouter reasoning documentation](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens) and [OpenAI Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) for upstream semantics. The target model must support the requested controls/effort levels; the gateway does not clamp them per model, guarantee that reasoning can be disabled, or synthesize thinking text when the upstream does not expose it. Total output limits are unchanged and must leave room for both reasoning and the answer.
+
+`Responses` always uses OpenAI semantics, independent of `ReasoningFormat`: the same budget/effort mapping above becomes `reasoning.effort`, and `max_tokens` becomes `max_output_tokens`. Explicit non-`none` effort also requests `reasoning.summary: "auto"`. Requests use `store: false` and request `reasoning.encrypted_content`. Reasoning summaries appear as thinking blocks; each block's opaque `gateway.responses.v1:` signature carries the original reasoning item, including encrypted content, for replay before the next assistant tool calls. This also works with SSE. These signatures transport OpenAI state; they are not Anthropic cryptographic signatures. Existing plaintext thinking history and native Anthropic signatures are omitted on this path. See [OpenAI reasoning state guidance](https://developers.openai.com/api/docs/guides/reasoning). Summary availability and supported effort levels depend on the model and account.
+
+Compatibility limits: Anthropic server tools (including native web search), document blocks, and other unsupported content blocks return 400. `/v1/messages/count_tokens` and other Messages sub-endpoints return 501 on translation backends; no token count is fabricated. Cache-control hints, native Anthropic thinking signatures/display options, metadata, `output_config` fields other than `effort`, and other Anthropic-only top-level options are omitted. In Chat Completions, text reasoning returned as `reasoning_content`/`reasoning` is represented as thinking blocks with empty signatures; assistant thinking history is forwarded as `reasoning_content`. Opaque redacted thinking is omitted on both paths. Anthropic signature verification and server-side features are not emulated. Actual model capabilities and usage reporting depend on the selected upstream.
+
+For client compatibility, translated requests also accept text-only `role: "system"` entries inside `messages`, in addition to the Anthropic top-level `system` field. Inline system entries retain their position and role in the upstream conversation; string content and arrays of text blocks are supported. Native passthrough requests are unchanged.
+
+Claude Code's client-executed MCP tool search is supported: tools marked `defer_loading: true` are omitted until referenced by `tool_reference` blocks in tool results or selected by a named `tool_choice`. Tool references become text in upstream tool replies, with the matching full schemas added to `tools`; call IDs and client-side execution are preserved. The client supplies the catalog on every request, so the gateway keeps no cross-session tool registry. References in retained history keep those schemas active. Responses uses `function_call`/`function_call_output` items and sets function schemas to `strict: false` to preserve optional parameters. This does not emulate Anthropic server-executed tool search or OpenAI hosted tool search.
+
+The `OpenAI` Chat Completions dialect and the Responses translator currently accept at most 128 active tools. If upfront tools plus referenced tools exceed that count, the gateway returns an actionable 400 without truncation. This limit is not imposed on the `OpenRouter` dialect, whose upstream may have its own limits. For a large MCP catalog, start a new Claude Code session with `ENABLE_TOOL_SEARCH=true`; `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` can disable deferral, and a previous tool-search rejection may have caused the current conversation to fall back to upfront loading. Disable unused MCP servers or compact/start a new conversation if too many referenced tools accumulate. See [Claude Code MCP tool search](https://code.claude.com/docs/en/mcp#scale-with-mcp-tool-search) and its [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol#retry-without-tool-search).
+
 ## Configuration
 
 All settings live in `appsettings.json`. `ModelDiscovery` is disabled by default and can expose the same catalog in two formats: OpenAI-compatible unless the inbound request has `anthropic-version`, in which case Anthropic model-list JSON is returned. A listed model does not implicitly create a model mapping; configure `ModelMapping` separately for routing.
@@ -105,7 +157,10 @@ All settings live in `appsettings.json`. `ModelDiscovery` is disabled by default
 | `ModelMapping` | `Rules` | — | Array of `{ "Prefix", "Target", "Backend", "ProxyServer" }` objects for model routing and rewriting |
 | `ModelDiscovery` | `Enabled` | `false` | Serve the configured model catalog locally at `GET /v1/models`; disabled requests continue to the upstream |
 | `ModelDiscovery` | `Models` | `[]` | Shared catalog entries with required `Id` and optional `DisplayName`, `CreatedAt` (ISO 8601), and `OwnedBy` |
-| `Backends` | `<name>.BaseUrl` | `openrouter` / `https://openrouter.ai/api` | Named Anthropic-compatible upstream backends |
+| `Backends` | `<name>.BaseUrl` | `openrouter` / `https://openrouter.ai/api` | Named upstream backends selected by model mapping or classifier routing |
+| `Backends` | `<name>.TranslateAnthropicToOpenAI` | `false` (committed `openrouter`: `true`) | Translate Anthropic Messages for this backend |
+| `Backends` | `<name>.OpenAIProtocol` | `ChatCompletions` (committed `openai`: `Responses`) | Upstream translation endpoint; Responses supports OpenAI reasoning with function tools |
+| `Backends` | `<name>.ReasoningFormat` | `OpenAI` (committed `openrouter`: `OpenRouter`) | Chat Completions reasoning and output limit dialect; Responses always uses OpenAI semantics |
 | `Upstream` | `BaseUrl` | `https://openrouter.ai/api` | Legacy fallback used when `Backends.openrouter` is not configured |
 | `Classifier` | `Target`, `Backend`, `ProxyServer` | — | Dedicated route for auto-mode classifier requests; empty `Target` disables it |
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
