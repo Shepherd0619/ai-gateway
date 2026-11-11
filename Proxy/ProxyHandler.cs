@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using AiGateway.Compliance;
 using AiGateway.Configuration;
+using AiGateway.Authentication;
 using Microsoft.Extensions.Options;
 
 namespace AiGateway.Proxy;
@@ -16,6 +17,8 @@ internal sealed class ProxyHandler
     private readonly BackendOptions _backends;
     private readonly RuntimeClassifierStore _classifier;
     private readonly RuntimeBackendTranslationStore? _translationStore;
+    private readonly ClientAuthentication _authentication;
+    private readonly BackendCredentialStore _credentials;
 
     public ProxyHandler(
         IHttpClientFactory hcf,
@@ -24,7 +27,9 @@ internal sealed class ProxyHandler
         ComplianceLogWriter complianceWriter,
         RuntimeClassifierStore classifier,
         IOptions<BackendOptions> backendOptions,
-        RuntimeBackendTranslationStore? translationStore = null)
+        RuntimeBackendTranslationStore? translationStore = null,
+        ClientAuthentication? authentication = null,
+        BackendCredentialStore? credentials = null)
     {
         _hcf = hcf;
         _logger = logger;
@@ -33,7 +38,13 @@ internal sealed class ProxyHandler
         _classifier = classifier;
         _backends = backendOptions.Value;
         _translationStore = translationStore;
+        _authentication = authentication ?? new ClientAuthentication(
+            Options.Create(new GatewayKeyOptions()), Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientAuthentication>.Instance);
+        _credentials = credentials ?? new BackendCredentialStore(backendOptions);
     }
+
+    internal Task<ClientCredential?> AuthenticateAsync(HttpContext ctx, bool allowAnonymous = false) =>
+        _authentication.AuthenticateAsync(ctx, allowAnonymous);
 
     internal static void ForwardClientIdentityHeaders(HttpRequest clientRequest, HttpRequestMessage upstreamRequest)
     {
@@ -66,21 +77,8 @@ internal sealed class ProxyHandler
         var path = ctx.Request.Path.Value ?? "/";
         var upstreamPath = path + ctx.Request.QueryString;
 
-        // 1. Extract API key — supports both x-api-key (desktop) and Authorization: Bearer (CLI)
-        var clientKey = ctx.Request.Headers["x-api-key"].FirstOrDefault();
-        if (string.IsNullOrEmpty(clientKey))
-        {
-            var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault();
-            if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-                clientKey = authHeader["Bearer ".Length..].Trim();
-        }
-        if (string.IsNullOrEmpty(clientKey))
-        {
-            ctx.Response.StatusCode = 401;
-            ctx.Response.ContentType = "application/json";
-            await ctx.Response.WriteAsync("""{"error":{"type":"authentication_error","message":"Missing x-api-key or Authorization: Bearer header"}}""", ctx.RequestAborted);
-            return;
-        }
+        var credential = await AuthenticateAsync(ctx);
+        if (credential is null) return;
 
         // 2. Read request body as raw UTF-8 bytes — a single buffered copy, no
         //    intermediate string.  (Previous approach read a UTF-16 string, parsed
@@ -166,6 +164,12 @@ internal sealed class ProxyHandler
         }
 
         var backendName = selectedBackend ?? BackendOptions.DefaultBackendName;
+        var upstreamKey = credential.IsGateway ? _credentials.GetKey(backendName) : credential.ByokKey;
+        if (string.IsNullOrEmpty(upstreamKey))
+        {
+            await ClientAuthentication.Reject(ctx, 503, "provider_key_not_configured", "The selected backend has no provider key configured.");
+            return;
+        }
         var configuredBackend = _backends[backendName];
         var translation = _translationStore?.Get(backendName);
         var translateEnabled = translation?.TranslateAnthropicToOpenAI
@@ -222,7 +226,7 @@ internal sealed class ProxyHandler
             Content = new ByteArrayContent(bodyToSend)
         };
         upstreamReq.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
-        upstreamReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {clientKey}");
+        upstreamReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {upstreamKey}");
 
         if (!translate)
         {

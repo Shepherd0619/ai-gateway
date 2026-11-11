@@ -18,6 +18,8 @@ internal static class BackendConfiguration
 
         foreach (var (name, config) in normalized)
         {
+            if (!string.IsNullOrWhiteSpace(config.ApiKey))
+                AiGateway.Authentication.BackendCredentialStore.ValidateKey(config.ApiKey);
             if (string.IsNullOrWhiteSpace(config.BaseUrl))
                 throw new InvalidOperationException($"Backend '{name}' has an empty BaseUrl.");
             if (!Enum.IsDefined(config.ReasoningFormat))
