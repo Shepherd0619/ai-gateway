@@ -403,12 +403,6 @@ internal static class AnthropicTranslator
         w.WriteNumber("cache_creation_input_tokens", 0); w.WriteNumber("cache_read_input_tokens", usage.Cached); w.WriteEndObject();
     }
 
-    internal static byte[] Error(int status, string message) => JsonSerializer.SerializeToUtf8Bytes(new
-    {
-        type = "error",
-        error = new { type = status switch { 400 => "invalid_request_error", 401 => "authentication_error", 403 => "permission_error", 404 => "not_found_error", 413 => "request_too_large", 429 => "rate_limit_error", 529 => "overloaded_error", _ => "api_error" }, message }
-    });
-
     internal static string ErrorMessage(JsonElement root, string fallback)
     {
         if (root.ValueKind != JsonValueKind.Object) return fallback;

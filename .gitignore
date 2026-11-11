@@ -7,3 +7,12 @@ obj/
 mappings-runtime.json
 classifier-runtime.json
 model-discovery-runtime.json
+.superpowers/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
