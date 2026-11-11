@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using AiGateway.Http;
 
 namespace AiGateway.Proxy;
 
@@ -191,7 +192,7 @@ internal sealed class AnthropicSseTranslator(HttpResponse response, string model
 
     internal async Task EmitErrorAsync(string message, int status = 502)
     {
-        var bytes = AnthropicTranslator.Error(status, message);
+        var bytes = ApiErrorResponse.CreateAnthropic(status, message);
         await response.WriteAsync("event: error\ndata: " + Encoding.UTF8.GetString(bytes) + "\n\n", cancellationToken);
         await response.Body.FlushAsync(cancellationToken);
         _completed = true;

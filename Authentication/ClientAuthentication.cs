@@ -1,5 +1,5 @@
 using System.Data.Common;
-using System.Text.Json;
+using AiGateway.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
@@ -69,10 +69,7 @@ internal sealed class ClientAuthentication(IOptions<GatewayKeyOptions> options, 
 
     internal static async Task<ClientCredential?> Reject(HttpContext ctx, int status, string type, string message)
     {
-        ctx.Response.StatusCode = status;
-        ctx.Response.ContentType = "application/json";
-        ctx.Response.Headers.CacheControl = "no-store";
-        await ctx.Response.WriteAsync(JsonSerializer.Serialize(new { error = new { type, message } }), ctx.RequestAborted);
+        await ApiErrorResponse.WriteAsync(ctx, status, type, message, noStore: true);
         return null;
     }
 
