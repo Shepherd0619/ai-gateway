@@ -20,7 +20,12 @@ internal static class DeferredToolCatalog
                 if (Text(block, "type") != "tool_result" || !block.TryGetProperty("content", out var parts)
                     || parts.ValueKind != JsonValueKind.Array) continue;
                 foreach (var part in parts.EnumerateArray())
-                    if (Text(part, "type") == "tool_reference") references.Add(ReferenceName(part));
+                {
+                    if (Text(part, "type") != "tool_reference") continue;
+                    var reference = ReferenceName(part);
+                    if (!string.Equals(reference, "web_search", StringComparison.Ordinal))
+                        references.Add(reference);
+                }
             }
         }
         if (!root.TryGetProperty("tools", out var tools))

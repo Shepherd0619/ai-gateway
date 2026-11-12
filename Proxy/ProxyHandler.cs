@@ -192,6 +192,12 @@ internal sealed class ProxyHandler
             ctx.Response.Headers["request-id"] = ctx.TraceIdentifier;
             try
             {
+                bodyToSend = AnthropicServerToolFallback.RemoveWebSearch(bodyToSend, out var webSearchRemoved);
+                if (webSearchRemoved)
+                    _logger.LogWarning(
+                        "Anthropic web_search server tool removed before translation; Firecrawl/context fallback guidance added. backend={Backend} trace={TraceId}",
+                        backendName, ctx.TraceIdentifier);
+
                 bodyToSend = responses ? AnthropicResponsesTranslator.TranslateRequest(bodyToSend, out responseStops)
                     : AnthropicTranslator.TranslateRequest(bodyToSend, reasoningFormat);
                 upstreamPath = (responses ? "/v1/responses" : "/v1/chat/completions") + ctx.Request.QueryString;
