@@ -265,7 +265,11 @@ internal static class AnthropicTranslator
                             Require(Text(part, "text") is not null, "Text block requires text.");
                             texts.Add(Text(part, "text")!); break;
                         case "tool_reference":
-                            texts.Add($"Tool available: {DeferredToolCatalog.ReferenceName(part)}"); break;
+                            var referenceName = DeferredToolCatalog.ReferenceName(part);
+                            texts.Add(string.Equals(referenceName, "web_search", StringComparison.Ordinal)
+                                ? "The built-in web_search server tool is unavailable; use Firecrawl MCP search tools if available."
+                                : $"Tool available: {referenceName}");
+                            break;
                         case "image":
                             if (!hasImages)
                                 userBlocks.Add(JsonSerializer.SerializeToElement(new { type = "text", text = $"Image result from tool call {id}:" }));
