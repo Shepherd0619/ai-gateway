@@ -1,4 +1,5 @@
 using AiGateway.Admin;
+using AiGateway.Authentication;
 using AiGateway.Compliance;
 using AiGateway.Configuration;
 using AiGateway.Discovery;
@@ -14,6 +15,9 @@ builder.Services.Configure<ComplianceLogOptions>(builder.Configuration.GetSectio
 builder.Services.Configure<CorsOptions>(builder.Configuration.GetSection("Cors"));
 builder.Services.Configure<AdminOptions>(builder.Configuration.GetSection("Admin"));
 builder.Services.Configure<ModelDiscoveryOptions>(builder.Configuration.GetSection("ModelDiscovery"));
+builder.Services.AddGatewayKeys(builder.Configuration);
+builder.Services.AddSingleton<ClientAuthentication>();
+builder.Services.AddSingleton<BackendCredentialStore>();
 
 // ── CORS ──
 var corsOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
@@ -91,6 +95,9 @@ builder.Services.AddTransient<ProxyHandler>();
 
 var app = builder.Build();
 
+app.UseTrustedForwarding(builder.Configuration);
+_ = app.Services.GetRequiredService<BackendCredentialStore>();
+await GatewayKeyDatabase.InitializeAsync(app.Services);
 app.UseCors("browser");
 
 // ── Startup diagnostic ──

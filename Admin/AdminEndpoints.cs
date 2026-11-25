@@ -34,6 +34,8 @@ internal static class AdminEndpoints
                 return await next(ctx);
             });
 
+        group.MapCredentialEndpoints();
+
         // GET /admin/backends — list configured backend names
         group.MapGet("/backends", (IOptions<BackendOptions> options) =>
             Results.Json(new { backends = options.Value.Keys }));

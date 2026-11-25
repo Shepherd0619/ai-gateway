@@ -214,6 +214,7 @@ public sealed class BackendTranslationEndpointsTests
             builder.Services.AddSingleton<RuntimeClassifierStore>();
             builder.Services.AddSingleton<RuntimeModelDiscoveryStore>();
             builder.Services.AddSingleton<RuntimeBackendTranslationStore>();
+            builder.Services.AddSingleton<AiGateway.Authentication.BackendCredentialStore>();
 
             var application = builder.Build();
             application.MapAdminEndpoints();

@@ -29,9 +29,17 @@ flowchart LR
 1. **Optional model discovery** — `GET /v1/models` serves a configured shared catalog when `ModelDiscovery:Enabled` is true (OpenAI-compatible format by default; Anthropic format when `anthropic-version` is present). When disabled (the default), the request is forwarded to the configured upstream unchanged.
 2. **Classifier detection** — Auto-mode security classifier requests are identified by their system-prompt signature and routed directly to the configured classifier route (`Classifier:Target` plus optional `Backend` and `ProxyServer`), bypassing ordinary model mapping entirely.
 3. **Model rewriting** — `claude-sonnet-4-20250514` in the request body becomes `deepseek/deepseek-v4-pro` before it hits OpenRouter. The response model name is rewritten back so the client never notices.
-4. **API key passthrough (BYOK)** — Both `x-api-key` (desktop) and `Authorization: Bearer` (CLI) headers are accepted. The key is forwarded as `Authorization: Bearer` upstream. You use your own OpenRouter key — no shared keys, no proxy-side auth.
+4. **Credentials** — Both `x-api-key` (desktop) and `Authorization: Bearer` (CLI) are accepted. BYOK forwards the supplied provider key. Optional server keys let a downstream gateway key authenticate locally, then select the provider key for the final backend, including classifier routes. Reserved `sk-aigw-` credentials never fall back to BYOK.
 
 For backends with `TranslateAnthropicToOpenAI: true`, the gateway translates Messages requests to Chat Completions or Responses and translates JSON/SSE responses back to Anthropic format. Other backends retain Anthropic passthrough with model rewriting. The committed OpenRouter backend enables translation.
+
+## Server keys
+
+Enable `GatewayKeys:Enabled` to issue and revoke downstream keys through the admin API. EF Core 9 / SQLite persists only key digests and metadata, including the last successful authentication time/IP. Provider keys come from `Backends:{name}:ApiKey` (for example Jenkins-injected `Backends__openrouter__ApiKey`); admin overrides stay in memory and reset on restart.
+
+The default remains BYOK with no database access. Enabling gateway keys also requires credentials for the local `/v1/models` catalog. All valid gateway keys can use all configured model routes; per-key access rules and quotas are not implemented.
+
+See [server key deployment and admin API](docs/admin-server-keys.md) for SQLite volume permissions, startup migrations, key management, trusted httpd forwarding, backup and recovery. The backend now depends on EF Core and its SQLite provider.
 
 ## Model mapping
 
@@ -121,7 +129,7 @@ Enable translation independently on each named backend:
 }
 ```
 
-The flag defaults to `false` when omitted. The committed OpenRouter configuration sets it to `true`. Set `Backends__openrouter__TranslateAnthropicToOpenAI=false` to restore the existing Anthropic route; backend configuration changes require a restart. Model mappings and classifier routing still select the model/backend/SOCKS proxy first, then the selected backend's flag determines translation. Existing API keys and client identity headers are forwarded.
+The flag defaults to `false` when omitted. The committed OpenRouter configuration sets it to `true`. Set `Backends__openrouter__TranslateAnthropicToOpenAI=false` to restore the existing Anthropic route; backend configuration changes require a restart. Model mappings and classifier routing still select the model/backend/SOCKS proxy first, then the selected backend's flag determines translation. The effective provider credential and client identity headers are forwarded; gateway keys are validated locally.
 
 `OpenAIProtocol` selects the upstream endpoint: `ChatCompletions` (default) uses `POST <BaseUrl>/v1/chat/completions`; `Responses` uses `POST <BaseUrl>/v1/responses`. Both preserve the query string. For official OpenAI models using reasoning with function tools, use `Responses`: some models reject this combination in Chat Completions. Configure `BaseUrl` without `/v1` (for example, `https://openrouter.ai/api` or `https://api.openai.com`). Returned messages restore the client's original model name without replacing model-like text inside generated content. Model discovery behavior is unchanged.
 
@@ -158,6 +166,10 @@ All settings live in `appsettings.json`. `ModelDiscovery` is disabled by default
 | `ModelDiscovery` | `Enabled` | `false` | Serve the configured model catalog locally at `GET /v1/models`; disabled requests continue to the upstream |
 | `ModelDiscovery` | `Models` | `[]` | Shared catalog entries with required `Id` and optional `DisplayName`, `CreatedAt` (ISO 8601), and `OwnedBy` |
 | `Backends` | `<name>.BaseUrl` | `openrouter` / `https://openrouter.ai/api` | Named upstream backends selected by model mapping or classifier routing |
+| `Backends` | `<name>.ApiKey` | unset | Provider key for gateway-authenticated traffic; optional memory-only admin override |
+| `GatewayKeys` | `Enabled` | `false` | Enable SQLite-backed gateway key issuance and authentication |
+| `ConnectionStrings` | `GatewayKeys` | `Data Source=gateway-keys.db` | File-backed SQLite database; use a writable persistent directory in Docker |
+| `ForwardedHeaders` | `Enabled`, `KnownProxies` | `false`, `[]` | Accept one normalized X-Forwarded-For hop only from explicitly trusted immediate proxies |
 | `Backends` | `<name>.TranslateAnthropicToOpenAI` | `false` (committed `openrouter`: `true`) | Translate Anthropic Messages for this backend |
 | `Backends` | `<name>.OpenAIProtocol` | `ChatCompletions` (committed `openai`: `Responses`) | Upstream translation endpoint; Responses supports OpenAI reasoning with function tools |
 | `Backends` | `<name>.ReasoningFormat` | `OpenAI` (committed `openrouter`: `OpenRouter`) | Chat Completions reasoning and output limit dialect; Responses always uses OpenAI semantics |
@@ -337,7 +349,7 @@ ai-gateway/
 │   └── ComplianceLogWriter.cs      # BackgroundService: Channel→file JSON-lines log
 ├── appsettings.json                # Runtime configuration
 ├── Dockerfile                      # Multi-stage build (SDK → chiseled runtime)
-└── ai-gateway.csproj               # .NET 9 Minimal API, no third-party dependencies
+└── ai-gateway.csproj               # .NET 9 Minimal API, EF Core SQLite
 ```
 
 ## Tech stack
@@ -346,13 +358,13 @@ ai-gateway/
 |---|---|
 | Runtime | .NET 9 Minimal API |
 | Container | `mcr.microsoft.com/dotnet/runtime-deps:9.0-noble-chiseled` |
-| Dependencies | **None** beyond the .NET BCL |
+| Dependencies | EF Core 9.x and SQLite provider; EF Design for migrations |
 | Docker image | ~35 MB compressed |
 | Memory (idle) | ~50-80 MB |
 
 ## Limitations
 
-- **No authentication on the proxy itself.** Deploy it on a trusted network (VPN / tailnet) or put a reverse proxy with auth in front of it.
+- **BYOK remains enabled.** Gateway keys authenticate locally when enabled, while BYOK credentials are validated upstream. Deploy on a trusted network or behind your existing access controls.
 - **OpenRouter-specific.** The proxy assumes an Anthropic-skin compatible upstream. It may work with other providers that speak the same format but hasn't been tested.
 - **Prompt injection protection.** OpenRouter's prompt injection guard may block classifier requests as false positives. If auto-mode fails with a `403` and `"prompt injection patterns detected"`, disable this protection in your [OpenRouter account settings](https://openrouter.ai/settings) under "Prompt Security".
 

@@ -20,6 +20,8 @@ internal static class ModelDiscoveryEndpoints
             return;
         }
 
+        if (await proxy.AuthenticateAsync(ctx, allowAnonymous: true) is null) return;
+
         if (ctx.Request.Headers.ContainsKey("anthropic-version"))
         {
             await ctx.Response.WriteAsJsonAsync(ToAnthropicResponse(snapshot.Models), ctx.RequestAborted);

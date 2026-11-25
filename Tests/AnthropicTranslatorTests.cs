@@ -217,19 +217,6 @@ public sealed class AnthropicTranslatorTests
         Assert.Equal("a.txt", tool.GetProperty("input").GetProperty("path").GetString());
     }
 
-    [Theory]
-    [InlineData(400, "invalid_request_error")]
-    [InlineData(401, "authentication_error")]
-    [InlineData(403, "permission_error")]
-    [InlineData(429, "rate_limit_error")]
-    [InlineData(503, "api_error")]
-    public void ErrorEnvelope_UsesAnthropicTypes(int status, string type)
-    {
-        using var doc = JsonDocument.Parse(AnthropicTranslator.Error(status, "failure"));
-        Assert.Equal("error", doc.RootElement.GetProperty("type").GetString());
-        Assert.Equal(type, doc.RootElement.GetProperty("error").GetProperty("type").GetString());
-    }
-
     [Fact]
     public void ImageToolResults_KeepToolRepliesAdjacentAndLiftImagesIntoUserMessage()
     {

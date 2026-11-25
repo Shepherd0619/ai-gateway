@@ -4,3 +4,13 @@
 Dockerfile
 .dockerignore
 *.md
+.superpowers/
+out/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db-journal
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.sqlite-journal
