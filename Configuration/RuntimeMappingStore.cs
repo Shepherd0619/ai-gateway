@@ -25,7 +25,7 @@ internal sealed class RuntimeMappingStore
         IOptions<BackendOptions> backendOptions,
         ILogger<RuntimeMappingStore> logger)
     {
-        _baseRules = baseOptions.Value.Rules;
+        _baseRules = baseOptions.Value.Rules.Select(rule => rule.NormalizeProxyServers()).ToList();
         _runtimeConfigPath = adminOptions.Value.RuntimeConfigPath;
         _proxyServers = proxyOptions.Value;
         _backends = backendOptions.Value;
@@ -39,6 +39,7 @@ internal sealed class RuntimeMappingStore
     /// </summary>
     public void Save(List<MappingRule> runtimeRules)
     {
+        runtimeRules = runtimeRules.Select(rule => rule.NormalizeProxyServers()).ToList();
         ValidateProxyServers(runtimeRules);
         BackendConfiguration.ValidateRules(runtimeRules, _backends);
         WriteRuntimeFile(runtimeRules);
@@ -52,6 +53,7 @@ internal sealed class RuntimeMappingStore
     /// </summary>
     public void Upsert(MappingRule rule)
     {
+        rule = rule.NormalizeProxyServers();
         ValidateProxyServers(new[] { rule });
         BackendConfiguration.ValidateRules(new[] { rule }, _backends);
         var runtimeRules = LoadRuntimeRules();
@@ -124,7 +126,9 @@ internal sealed class RuntimeMappingStore
         try
         {
             var json = File.ReadAllText(_runtimeConfigPath);
-            return JsonSerializer.Deserialize<List<MappingRule>>(json) ?? [];
+            return (JsonSerializer.Deserialize<List<MappingRule>>(json) ?? [])
+                .Select(rule => rule.NormalizeProxyServers())
+                .ToList();
         }
         catch (Exception ex)
         {
@@ -147,10 +151,13 @@ internal sealed class RuntimeMappingStore
     {
         foreach (var rule in rules)
         {
-            if (!string.IsNullOrEmpty(rule.ProxyServer) && !_proxyServers.ContainsKey(rule.ProxyServer))
+            foreach (var proxyServer in rule.ProxyServers ?? [])
             {
-                throw new InvalidOperationException(
-                    $"ProxyServer '{rule.ProxyServer}' referenced by rule '{rule.Prefix}' is not defined in ProxyServers section.");
+                if (string.IsNullOrWhiteSpace(proxyServer) || !_proxyServers.ContainsKey(proxyServer))
+                {
+                    throw new InvalidOperationException(
+                        $"ProxyServer '{proxyServer}' referenced by rule '{rule.Prefix}' is not defined in ProxyServers section.");
+                }
             }
         }
     }

@@ -279,7 +279,7 @@ internal static class AdminEndpoints
     {
         target = snapshot.Enabled ? snapshot.Target : null,
         backend = snapshot.Enabled ? snapshot.Backend : null,
-        proxyServer = snapshot.Enabled ? snapshot.ProxyServer : null,
+        proxyServers = snapshot.ProxyServers,
         source = snapshot.Source,
     };
 

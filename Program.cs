@@ -36,7 +36,8 @@ builder.Services.AddSingleton<Microsoft.Extensions.Options.IOptions<BackendOptio
 
 builder.Services.Configure<ProxyServerOptions>(builder.Configuration.GetSection("ProxyServers"));
 var proxyServers = builder.Configuration.GetSection("ProxyServers").Get<ProxyServerOptions>() ?? new ProxyServerOptions();
-var mappingRules = builder.Configuration.GetSection("ModelMapping:Rules").Get<List<MappingRule>>() ?? [];
+var mappingRules = (builder.Configuration.GetSection("ModelMapping:Rules").Get<List<MappingRule>>() ?? [])
+    .Select(rule => rule.NormalizeProxyServers()).ToList();
 BackendConfiguration.ValidateRules(mappingRules, backends);
 
 foreach (var (backendName, backendConfig) in backends)
@@ -68,17 +69,19 @@ foreach (var (backendName, backendConfig) in backends)
     }
 }
 
-// ── Validate ProxyServer references in mapping rules ──
+// ── Validate mapping proxy references ──
 foreach (var rule in mappingRules)
 {
-    if (!string.IsNullOrEmpty(rule.ProxyServer) && !proxyServers.ContainsKey(rule.ProxyServer))
+    foreach (var proxyServer in rule.ProxyServers ?? [])
     {
-        var criticalMsg = $"Configuration error: MappingRule '{rule.Prefix}' references ProxyServer '{rule.ProxyServer}' which is not defined in ProxyServers section.";
-        Console.Error.WriteLine(criticalMsg);
-        throw new InvalidOperationException(criticalMsg);
+        if (string.IsNullOrWhiteSpace(proxyServer) || !proxyServers.ContainsKey(proxyServer))
+        {
+            var criticalMsg = $"Configuration error: MappingRule '{rule.Prefix}' references ProxyServer '{proxyServer}' which is not defined in ProxyServers section.";
+            Console.Error.WriteLine(criticalMsg);
+            throw new InvalidOperationException(criticalMsg);
+        }
     }
 }
-
 var upstreamBaseUrl = backends[BackendOptions.DefaultBackendName].BaseUrl;
 
 // ── Application services ──
@@ -107,10 +110,9 @@ var corsOpts = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOpt
 startupLogger.LogInformation("Startup: upstream={Url}, origins=[{Origins}], rules=[{Rules}]",
     upstreamBaseUrl, string.Join(", ", corsOpts.AllowedOrigins),
     string.Join(", ", mapping.Rules.Select(r =>
-        string.IsNullOrEmpty(r.ProxyServer)
+        r.ProxyServers is not { Count: > 0 }
             ? $"{r.Prefix}→{r.Target}"
-            : $"{r.Prefix}→[proxy:{r.ProxyServer}]")));
-
+            : $"{r.Prefix}→[proxies:{string.Join(" > ", r.ProxyServers)}]")));
 // ── Endpoints ──
 app.MapHealthEndpoints();
 app.MapAdminEndpoints();
