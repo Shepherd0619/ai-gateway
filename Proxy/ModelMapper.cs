@@ -2,7 +2,16 @@ using AiGateway.Configuration;
 
 namespace AiGateway.Proxy;
 
-internal record MapResult(string TargetModel, string Backend, string? ProxyServer);
+internal record MapResult(string TargetModel, string Backend, string? ProxyServer)
+{
+    private IReadOnlyList<string>? _proxyServers;
+
+    public IReadOnlyList<string> ProxyServers
+    {
+        get => _proxyServers ?? (ProxyServer is null ? [] : [ProxyServer]);
+        init => _proxyServers = value;
+    }
+}
 
 internal sealed class ModelMapper
 {
@@ -16,7 +25,7 @@ internal sealed class ModelMapper
         var backend = BackendOptions.DefaultBackendName;
         var backendSelected = false;
         var proxySelected = false;
-        string? proxyServer = null;
+        IReadOnlyList<string> proxyServers = [];
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         while (visited.Add(current))
@@ -32,9 +41,9 @@ internal sealed class ModelMapper
                 backendSelected = true;
             }
 
-            if (!proxySelected && rule.ProxyServer is not null)
+            if (!proxySelected && rule.ProxyServers is not null)
             {
-                proxyServer = string.IsNullOrEmpty(rule.ProxyServer) ? null : rule.ProxyServer;
+                proxyServers = rule.ProxyServers;
                 proxySelected = true;
             }
 
@@ -44,6 +53,9 @@ internal sealed class ModelMapper
             current = rule.Target;
         }
 
-        return new MapResult(current, backend, proxyServer);
+        return new MapResult(current, backend, proxyServers.FirstOrDefault())
+        {
+            ProxyServers = proxyServers
+        };
     }
 }

@@ -27,7 +27,7 @@ flowchart LR
 ```
 
 1. **Optional model discovery** — `GET /v1/models` serves a configured shared catalog when `ModelDiscovery:Enabled` is true (OpenAI-compatible format by default; Anthropic format when `anthropic-version` is present). When disabled (the default), the request is forwarded to the configured upstream unchanged.
-2. **Classifier detection** — Auto-mode security classifier requests are identified by their system-prompt signature and routed directly to the configured classifier route (`Classifier:Target` plus optional `Backend` and `ProxyServer`), bypassing ordinary model mapping entirely.
+2. **Classifier detection** — Auto-mode security classifier requests are identified by their system-prompt signature and routed directly to the configured classifier route (`Classifier:Target` plus optional `Backend` and ordered `ProxyServers`), bypassing ordinary model mapping entirely.
 3. **Model rewriting** — `claude-sonnet-4-20250514` in the request body becomes `deepseek/deepseek-v4-pro` before it hits OpenRouter. The response model name is rewritten back so the client never notices.
 4. **Credentials** — Both `x-api-key` (desktop) and `Authorization: Bearer` (CLI) are accepted. BYOK forwards the supplied provider key. Optional server keys let a downstream gateway key authenticate locally, then select the provider key for the final backend, including classifier routes. Reserved `sk-aigw-` credentials never fall back to BYOK.
 
@@ -162,7 +162,7 @@ All settings live in `appsettings.json`. `ModelDiscovery` is disabled by default
 
 | Section | Key | Default | Description |
 |---|---|---|---|
-| `ModelMapping` | `Rules` | — | Array of `{ "Prefix", "Target", "Backend", "ProxyServer" }` objects for model routing and rewriting |
+| `ModelMapping` | `Rules` | — | Array of `{ "Prefix", "Target", "Backend", "ProxyServers" }` objects for model routing, rewriting, and ordered proxy failover |
 | `ModelDiscovery` | `Enabled` | `false` | Serve the configured model catalog locally at `GET /v1/models`; disabled requests continue to the upstream |
 | `ModelDiscovery` | `Models` | `[]` | Shared catalog entries with required `Id` and optional `DisplayName`, `CreatedAt` (ISO 8601), and `OwnedBy` |
 | `Backends` | `<name>.BaseUrl` | `openrouter` / `https://openrouter.ai/api` | Named upstream backends selected by model mapping or classifier routing |
@@ -174,11 +174,31 @@ All settings live in `appsettings.json`. `ModelDiscovery` is disabled by default
 | `Backends` | `<name>.OpenAIProtocol` | `ChatCompletions` (committed `openai`: `Responses`) | Upstream translation endpoint; Responses supports OpenAI reasoning with function tools |
 | `Backends` | `<name>.ReasoningFormat` | `OpenAI` (committed `openrouter`: `OpenRouter`) | Chat Completions reasoning and output limit dialect; Responses always uses OpenAI semantics |
 | `Upstream` | `BaseUrl` | `https://openrouter.ai/api` | Legacy fallback used when `Backends.openrouter` is not configured |
-| `Classifier` | `Target`, `Backend`, `ProxyServer` | — | Dedicated route for auto-mode classifier requests; empty `Target` disables it |
+| `Classifier` | `Target`, `Backend`, `ProxyServers` | — | Dedicated route for auto-mode classifier requests with ordered proxy failover; empty `Target` disables it |
 | `ComplianceLog` | `Enabled` | `false` | Enable per-request JSON-line audit log |
 | `ComplianceLog` | `Path` | `/var/log/ai-gateway/compliance.log` | Where to write the compliance log |
 | `Admin` | `ApiKey` | — | API key protecting the admin API (unset disables it) |
 | `Admin` | `RuntimeConfigPath` | `mappings-runtime.json` | Where runtime mapping overrides are persisted; classifier and model discovery overrides are stored beside it as `classifier-runtime.json` and `model-discovery-runtime.json`, and backend translations as `backend-translations-runtime.json` (or `backend-translations-runtime-overrides.json` if that basename would collide with this configured path) |
+
+### Mapping proxy failover
+
+A mapping rule can list SOCKS5 proxies in priority order. The first proxy is the preferred route; later entries are attempted only when connecting through the current proxy fails or times out. Any upstream HTTP response, including an error status, ends the attempt sequence. An empty array clears an inherited proxy route and uses a direct connection.
+
+```json
+{
+  "ProxyServers": {
+    "us-exit": { "Address": "socks5://us-proxy.example:1080" },
+    "eu-exit": { "Address": "socks5://eu-proxy.example:1080" }
+  },
+  "ModelMapping": {
+    "Rules": [
+      { "Prefix": "google/", "ProxyServers": ["us-exit", "eu-exit"] }
+    ]
+  }
+}
+```
+
+The legacy scalar `ProxyServer` is accepted when reading existing mapping and classifier configuration and runtime files. Admin responses and newly persisted runtime data use the canonical `ProxyServers` array.
 
 The admin UI harden/export action includes both `ModelMapping` and the standalone `Classifier` route. Classifier routing is not evaluated through `ModelMapping` at runtime.
 
@@ -186,17 +206,17 @@ The classifier admin endpoints are `GET/PUT/DELETE /admin/classifier`. An empty 
 
 ### Classifier configuration breaking change
 
-Classifier routing now uses the same route fields as model mappings:
+Classifier routing uses the same ordered proxy list as model mappings. Its first proxy is preferred; connection exceptions and timeouts advance to the next entry, while HTTP responses end the attempt sequence. Classifier routing continues to use its dedicated route settings:
 
 ```json
 "Classifier": {
   "Target": "deepseek/deepseek-v4-flash",
   "Backend": "openrouter",
-  "ProxyServer": null
+  "ProxyServers": ["us-exit", "eu-exit"]
 }
 ```
 
-`Classifier:TargetModel` is no longer supported. Classifier runtime overrides in `classifier-runtime.json` and `PUT /admin/classifier` use `Target`, `Backend`, and `ProxyServer`; existing `TargetModel` values must be migrated manually.
+`Classifier:TargetModel` is no longer supported. Classifier runtime overrides in `classifier-runtime.json` and `PUT /admin/classifier` use `Target`, `Backend`, and `ProxyServers`; existing `TargetModel` values must be migrated manually.
 
 
 ## Runtime model mapping (admin API)

@@ -94,7 +94,7 @@ internal sealed class ProxyHandler
         string? upstreamModel = null;
         string? role = null;
         string? selectedBackend = null;
-        string? proxyServer = null;
+        IReadOnlyList<string> selectedProxyServers = [];
         byte[] bodyToSend = bodyBytes;
         var contentType = ctx.Request.ContentType ?? "application/json";
         bool clientWantsStream = false;
@@ -128,7 +128,7 @@ internal sealed class ProxyHandler
                         originalModel = GetModel(root) ?? "claude-sonnet-4-20250514";
                         upstreamModel = classifierSnapshot.Target!;
                         selectedBackend = classifierSnapshot.Backend;
-                        proxyServer = classifierSnapshot.ProxyServer;
+                        selectedProxyServers = classifierSnapshot.ProxyServers;
                         newModel = upstreamModel;
                         LogClassifierDiagnostics(root, isClassifier);
                     }
@@ -138,7 +138,7 @@ internal sealed class ProxyHandler
                         var mapResult = _mapper.Map(model);
                         upstreamModel = mapResult.TargetModel;
                         selectedBackend = mapResult.Backend;
-                        proxyServer = mapResult.ProxyServer;
+                        selectedProxyServers = mapResult.ProxyServers;
                         if (upstreamModel != model)
                             newModel = upstreamModel;
                     }
@@ -221,40 +221,76 @@ internal sealed class ProxyHandler
         // compliance logging is enabled (otherwise the bytes are never needed again).
         var requestBody = _complianceWriter.IsEnabled ? Encoding.UTF8.GetString(bodyBytes) : string.Empty;
 
-        // 4. Build and send upstream request
-        var route = BackendRoute.Create(
-            new MapResult(upstreamModel ?? originalModel ?? "", selectedBackend ?? BackendOptions.DefaultBackendName, proxyServer),
-            _backends,
-            upstreamPath);
-        var fullUrl = route.Url;
-        var client = _hcf.CreateClient(route.HttpClientName);
-        using var upstreamReq = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), fullUrl)
+        // 4. Build and send upstream request. Each retry gets a fresh request message,
+        //    while preserving the body, credentials, and all request headers.
+        var mappedRoute = new MapResult(
+            upstreamModel ?? originalModel ?? "",
+            selectedBackend ?? BackendOptions.DefaultBackendName,
+            selectedProxyServers.FirstOrDefault())
         {
-            Content = new ByteArrayContent(bodyToSend)
+            ProxyServers = selectedProxyServers
         };
-        upstreamReq.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
-        upstreamReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {upstreamKey}");
-
-        if (!translate)
-        {
-            var anthropicVersion = ctx.Request.Headers["anthropic-version"].FirstOrDefault() ?? "2023-06-01";
-            upstreamReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion);
-        }
-        ForwardClientIdentityHeaders(ctx.Request, upstreamReq);
-
-        if (_logger.IsEnabled(LogLevel.Debug))
-        {
-            var preview = bodyToSend.Length > 500 ? Encoding.UTF8.GetString(bodyToSend, 0, 500) : Encoding.UTF8.GetString(bodyToSend);
-            _logger.LogDebug("DIAG upstream req {Method} {FullUrl} originalModel={Orig} upstreamModel={Up} bodyLen={BodyLen} body={Body}",
-                ctx.Request.Method, fullUrl, originalModel, upstreamModel, bodyToSend.Length, preview);
-        }
-
+        string?[] proxyAttempts = selectedProxyServers.Count == 0
+            ? [null]
+            : selectedProxyServers.Select(proxy => (string?)proxy).ToArray();
         var sw = Stopwatch.StartNew();
         HttpResponseMessage upstreamResp;
+        var responseReadTimeout = Timeout.InfiniteTimeSpan;
         try
         {
-            var completionOption = clientWantsStream ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead;
-            upstreamResp = await client.SendAsync(upstreamReq, completionOption, ctx.RequestAborted);
+            const HttpCompletionOption completionOption = HttpCompletionOption.ResponseHeadersRead;
+            upstreamResp = null!;
+            for (var attempt = 0; attempt < proxyAttempts.Length; attempt++)
+            {
+                var route = BackendRoute.Create(mappedRoute, _backends, upstreamPath, proxyAttempts[attempt]);
+                var fullUrl = route.Url;
+                var client = _hcf.CreateClient(route.HttpClientName);
+                using var upstreamReq = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), fullUrl)
+                {
+                    Content = new ByteArrayContent(bodyToSend)
+                };
+                upstreamReq.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
+                upstreamReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {upstreamKey}");
+
+                if (!translate)
+                {
+                    var anthropicVersion = ctx.Request.Headers["anthropic-version"].FirstOrDefault() ?? "2023-06-01";
+                    upstreamReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion);
+                }
+                ForwardClientIdentityHeaders(ctx.Request, upstreamReq);
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    var preview = bodyToSend.Length > 500 ? Encoding.UTF8.GetString(bodyToSend, 0, 500) : Encoding.UTF8.GetString(bodyToSend);
+                    _logger.LogDebug("DIAG upstream req {Method} {FullUrl} originalModel={Orig} upstreamModel={Up} bodyLen={BodyLen} body={Body}",
+                        ctx.Request.Method, fullUrl, originalModel, upstreamModel, bodyToSend.Length, preview);
+                }
+
+                try
+                {
+                    var attemptTimer = Stopwatch.StartNew();
+                    upstreamResp = await client.SendAsync(upstreamReq, completionOption, ctx.RequestAborted);
+                    if (client.Timeout != Timeout.InfiniteTimeSpan)
+                    {
+                        var remainingTimeout = client.Timeout - attemptTimer.Elapsed;
+                        responseReadTimeout = remainingTimeout > TimeSpan.Zero ? remainingTimeout : TimeSpan.Zero;
+                    }
+                    break;
+                }
+                catch (TaskCanceledException) when (!ctx.RequestAborted.IsCancellationRequested && attempt + 1 < proxyAttempts.Length)
+                {
+                    _logger.LogWarning(
+                        "Proxy attempt timed out; trying next configured proxy. backend={Backend} proxy={ProxyServer} nextProxy={NextProxyServer} trace={TraceId}",
+                        mappedRoute.Backend, proxyAttempts[attempt], proxyAttempts[attempt + 1], ctx.TraceIdentifier);
+                }
+                catch (HttpRequestException ex) when (
+                    !ctx.RequestAborted.IsCancellationRequested && attempt + 1 < proxyAttempts.Length)
+                {
+                    _logger.LogWarning(ex,
+                        "Proxy connection failed; trying next configured proxy. backend={Backend} proxy={ProxyServer} nextProxy={NextProxyServer} trace={TraceId}",
+                        mappedRoute.Backend, proxyAttempts[attempt], proxyAttempts[attempt + 1], ctx.TraceIdentifier);
+                }
+            }
         }
         catch (TaskCanceledException) when (!ctx.RequestAborted.IsCancellationRequested)
         {
@@ -288,13 +324,24 @@ internal sealed class ProxyHandler
             {
                 try
                 {
-                    await HandleNonStreaming(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, role, translate, responses, responseStops);
+                    await HandleNonStreaming(ctx, upstreamResp, originalModel, upstreamModel, requestBody, path, sw, responseReadTimeout, role, translate, responses, responseStops);
                 }
                 catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
                 {
                     _logger.LogInformation("Proxy client disconnected {Method} {Path} {Original}->{Upstream} {DurationMs}ms{Role}",
                         ctx.Request.Method, path, originalModel ?? "-", upstreamModel ?? "-",
                         sw.ElapsedMilliseconds, role is not null ? $" [{role}]" : "");
+                }
+                catch (OperationCanceledException)
+                {
+                    if (translate)
+                        await ApiErrorResponse.WriteAnthropicAsync(ctx, 504, "Upstream request timed out.");
+                    else
+                        await ApiErrorResponse.WriteAsync(ctx, 504, "timeout", "Upstream request timed out");
+                }
+                catch (HttpRequestException) when (translate)
+                {
+                    await ApiErrorResponse.WriteAnthropicAsync(ctx, 502, "Unable to connect to the upstream backend.");
                 }
             }
         }
@@ -398,10 +445,14 @@ internal sealed class ProxyHandler
         string requestBody,
         string path,
         Stopwatch sw,
+        TimeSpan responseReadTimeout,
         string? role, bool translate = false, bool responses = false, IReadOnlyList<string>? responseStops = null)
     {
         // Read upstream response as raw bytes (non-streaming or error).
-        var respBytes = await upstreamResp.Content.ReadAsByteArrayAsync(ctx.RequestAborted);
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+        if (responseReadTimeout != Timeout.InfiniteTimeSpan)
+            readCts.CancelAfter(responseReadTimeout);
+        var respBytes = await upstreamResp.Content.ReadAsByteArrayAsync(readCts.Token);
         var respToSend = ErrorResponseNormalizer.Normalize(respBytes, !upstreamResp.IsSuccessStatusCode);
         var statusCode = (int)upstreamResp.StatusCode;
         if (translate)

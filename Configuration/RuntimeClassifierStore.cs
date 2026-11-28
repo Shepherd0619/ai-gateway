@@ -9,9 +9,16 @@ internal sealed record ClassifierSnapshot(
     string? ProxyServer,
     string Source)
 {
+    private IReadOnlyList<string>? _proxyServers;
+
+    public IReadOnlyList<string> ProxyServers
+    {
+        get => _proxyServers ?? (ProxyServer is null ? [] : [ProxyServer]);
+        init => _proxyServers = value;
+    }
+
     public bool Enabled => !string.IsNullOrEmpty(Target);
 }
-
 internal sealed class RuntimeClassifierStore
 {
     private readonly ClassifierOptions _baseOptions;
@@ -95,6 +102,15 @@ internal sealed class RuntimeClassifierStore
 
     private void Validate(ClassifierOptions options)
     {
+        foreach (var proxyServer in options.ProxyServers ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(proxyServer) || !_proxyServers.ContainsKey(proxyServer))
+            {
+                throw new InvalidOperationException(
+                    $"ProxyServer '{proxyServer}' referenced by classifier is not defined in ProxyServers section.");
+            }
+        }
+
         if (string.IsNullOrEmpty(options.Target))
             return;
 
@@ -106,21 +122,30 @@ internal sealed class RuntimeClassifierStore
             throw new InvalidOperationException(
                 $"Backend '{backendName}' referenced by classifier is not defined in Backends section.");
         }
+    }
+    private static ClassifierOptions Normalize(ClassifierOptions options)
+    {
+        var proxyServers = options.ProxyServers;
+        if (proxyServers is null)
+            proxyServers = string.IsNullOrWhiteSpace(options.ProxyServer) ? [] : [options.ProxyServer.Trim()];
 
-        if (!string.IsNullOrEmpty(options.ProxyServer) && !_proxyServers.ContainsKey(options.ProxyServer))
+        if (proxyServers is not null)
+            proxyServers = proxyServers.Select(proxy => proxy?.Trim() ?? "")
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+        return options with
         {
-            throw new InvalidOperationException(
-                $"ProxyServer '{options.ProxyServer}' referenced by classifier is not defined in ProxyServers section.");
-        }
+            Target = string.IsNullOrWhiteSpace(options.Target) ? "" : options.Target.Trim(),
+            Backend = string.IsNullOrWhiteSpace(options.Backend) ? null : options.Backend.Trim(),
+            ProxyServers = proxyServers,
+            ProxyServer = null,
+        };
     }
 
-    private static ClassifierOptions Normalize(ClassifierOptions options) => options with
-    {
-        Target = string.IsNullOrWhiteSpace(options.Target) ? "" : options.Target.Trim(),
-        Backend = string.IsNullOrWhiteSpace(options.Backend) ? null : options.Backend.Trim(),
-        ProxyServer = string.IsNullOrWhiteSpace(options.ProxyServer) ? null : options.ProxyServer.Trim(),
-    };
-
     private static ClassifierSnapshot ToSnapshot(ClassifierOptions options, string source) =>
-        new(options.Target, options.Backend ?? BackendOptions.DefaultBackendName, options.ProxyServer, source);
+        new(options.Target, options.Backend ?? BackendOptions.DefaultBackendName, options.ProxyServers?.FirstOrDefault(), source)
+        {
+            ProxyServers = options.ProxyServers ?? []
+        };
 }
